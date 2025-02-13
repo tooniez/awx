@@ -147,22 +147,6 @@ class TestKeyRegeneration:
         with override_settings(SECRET_KEY=new_key):
             assert json.loads(new_job.decrypted_extra_vars())['secret_key'] == 'donttell'
 
-    def test_oauth2_application_client_secret(self, oauth_application):
-        # test basic decryption
-        secret = oauth_application.client_secret
-        assert len(secret) == 128
-
-        # re-key the client_secret
-        new_key = regenerate_secret_key.Command().handle()
-
-        # verify that the old SECRET_KEY doesn't work
-        with pytest.raises(InvalidToken):
-            models.OAuth2Application.objects.get(pk=oauth_application.pk).client_secret
-
-        # verify that the new SECRET_KEY *does* work
-        with override_settings(SECRET_KEY=new_key):
-            assert models.OAuth2Application.objects.get(pk=oauth_application.pk).client_secret == secret
-
     def test_use_custom_key_with_tower_secret_key_env_var(self):
         custom_key = 'MXSq9uqcwezBOChl/UfmbW1k4op+bC+FQtwPqgJ1u9XV'
         os.environ['TOWER_SECRET_KEY'] = custom_key
@@ -171,13 +155,17 @@ class TestKeyRegeneration:
 
     def test_use_custom_key_with_empty_tower_secret_key_env_var(self):
         os.environ['TOWER_SECRET_KEY'] = ''
-        new_key = call_command('regenerate_secret_key', '--use-custom-key')
-        assert settings.SECRET_KEY != new_key
+        with pytest.raises(SystemExit) as e:
+            call_command('regenerate_secret_key', '--use-custom-key')
+        assert e.type == SystemExit
+        assert e.value.code == 1
 
     def test_use_custom_key_with_no_tower_secret_key_env_var(self):
         os.environ.pop('TOWER_SECRET_KEY', None)
-        new_key = call_command('regenerate_secret_key', '--use-custom-key')
-        assert settings.SECRET_KEY != new_key
+        with pytest.raises(SystemExit) as e:
+            call_command('regenerate_secret_key', '--use-custom-key')
+        assert e.type == SystemExit
+        assert e.value.code == 1
 
     def test_with_tower_secret_key_env_var(self):
         custom_key = 'MXSq9uqcwezBOChl/UfmbW1k4op+bC+FQtwPqgJ1u9XV'

@@ -14,9 +14,7 @@ import yaml
 from awxkit.words import words
 from awxkit.exceptions import WaitUntilTimeout
 
-
 log = logging.getLogger(__name__)
-
 
 cloud_types = (
     'aws',
@@ -117,7 +115,7 @@ class PseudoNamespace(dict):
                 for key in iterable:
                     self[key] = iterable[key]
             else:
-                for (k, v) in iterable:
+                for k, v in iterable:
                     self[k] = v
         for k in kw:
             self[k] = kw[k]
@@ -268,9 +266,9 @@ def random_utf8(*args, **kwargs):
     exception when a character outside of the BMP is sent to `send_keys`.
     Code pulled from http://stackoverflow.com/a/3220210.
     """
-    pattern = re.compile('[^\u0000-\uD7FF\uE000-\uFFFF]', re.UNICODE)
+    pattern = re.compile('[^\u0000-\ud7ff\ue000-\uffff]', re.UNICODE)
     length = args[0] if len(args) else kwargs.get('length', 10)
-    scrubbed = pattern.sub('\uFFFD', ''.join([gen_utf_char() for _ in range(length)]))
+    scrubbed = pattern.sub('\ufffd', ''.join([gen_utf_char() for _ in range(length)]))
 
     return scrubbed
 

@@ -1,8 +1,5 @@
 "component:api":
-  - any: ["awx/**/*", "!awx/ui/**"]
-
-"component:ui":
-  - any: ["awx/ui/**/*"]
+  - any: ["awx/**/*"]
 
 "component:docs":
   - any: ["docs/**/*"]
@@ -14,6 +11,4 @@
   - any: ["awx_collection/**/*"]
 
 "dependencies":
-  - any: ["awx/ui/package.json"]
-  - any: ["awx/requirements/*.txt"]
-  - any: ["awx/requirements/requirements.in"]
+  - any: ["requirements/*"]

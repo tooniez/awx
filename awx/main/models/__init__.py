@@ -1,22 +1,35 @@
 # Copyright (c) 2015 Ansible, Inc.
 # All Rights Reserved.
 
+import json
+
 # Django
 from django.conf import settings  # noqa
+from django.db import connection
 from django.db.models.signals import pre_delete  # noqa
 
+# django-ansible-base
+from ansible_base.resource_registry.fields import AnsibleResourceField
+from ansible_base.rbac import permission_registry
+from ansible_base.rbac.models import RoleDefinition, RoleUserAssignment
+from ansible_base.lib.utils.models import prevent_search
+from ansible_base.lib.utils.models import user_summary_fields
+
 # AWX
-from awx.main.models.base import BaseModel, PrimordialModel, prevent_search, accepts_json, CLOUD_INVENTORY_SOURCES, VERBOSITY_CHOICES  # noqa
+from awx.main.models.base import BaseModel, PrimordialModel, accepts_json, VERBOSITY_CHOICES  # noqa
 from awx.main.models.unified_jobs import UnifiedJob, UnifiedJobTemplate, StdoutMaxBytesExceeded  # noqa
-from awx.main.models.organization import Organization, Profile, Team, UserSessionMembership  # noqa
+from awx.main.models.organization import Organization, Team, UserSessionMembership  # noqa
 from awx.main.models.credential import Credential, CredentialType, CredentialInputSource, ManagedCredentialType, build_safe_env  # noqa
 from awx.main.models.projects import Project, ProjectUpdate  # noqa
+from awx.main.models.receptor_address import ReceptorAddress  # noqa
 from awx.main.models.inventory import (  # noqa
     CustomInventoryScript,
     Group,
     Host,
     HostMetric,
+    HostMetricSummaryMonthly,
     Inventory,
+    InventoryConstructedInventoryMembership,
     InventorySource,
     InventoryUpdate,
     SmartInventoryMembership,
@@ -54,7 +67,6 @@ from awx.main.models.ha import (  # noqa
 from awx.main.models.rbac import (  # noqa
     Role,
     batch_role_ancestor_rebuilding,
-    get_roles_on_resource,
     role_summary_fields_generator,
     ROLE_SINGLETON_SYSTEM_ADMINISTRATOR,
     ROLE_SINGLETON_SYSTEM_AUDITOR,
@@ -81,20 +93,70 @@ from awx.main.models.workflow import (  # noqa
     WorkflowApproval,
     WorkflowApprovalTemplate,
 )
-from awx.api.versioning import reverse
-from awx.main.models.oauth import OAuth2AccessToken, OAuth2Application  # noqa
-from oauth2_provider.models import Grant, RefreshToken  # noqa -- needed django-oauth-toolkit model migrations
 
 
 # Add custom methods to User model for permissions checks.
 from django.contrib.auth.models import User  # noqa
-from awx.main.access import get_user_queryset, check_user_access, check_user_access_with_errors, user_accessible_objects  # noqa
+from awx.main.access import get_user_queryset, check_user_access, check_user_access_with_errors  # noqa
 
 
 User.add_to_class('get_queryset', get_user_queryset)
 User.add_to_class('can_access', check_user_access)
 User.add_to_class('can_access_with_errors', check_user_access_with_errors)
-User.add_to_class('accessible_objects', user_accessible_objects)
+User.add_to_class('resource', AnsibleResourceField(primary_key_field="id"))
+User.add_to_class('summary_fields', user_summary_fields)
+
+
+def convert_jsonfields():
+    if connection.vendor != 'postgresql':
+        return
+
+    # fmt: off
+    fields = [
+        ('main_activitystream', 'id', (
+            'deleted_actor',
+            'setting',
+        )),
+        ('main_job', 'unifiedjob_ptr_id', (
+            'survey_passwords',
+        )),
+        ('main_joblaunchconfig', 'id', (
+            'char_prompts',
+            'survey_passwords',
+        )),
+        ('main_notification', 'id', (
+            'body',
+        )),
+        ('main_unifiedjob', 'id', (
+            'job_env',
+        )),
+        ('main_workflowjob', 'unifiedjob_ptr_id', (
+            'char_prompts',
+            'survey_passwords',
+        )),
+        ('main_workflowjobnode', 'id', (
+            'char_prompts',
+            'survey_passwords',
+        )),
+    ]
+    # fmt: on
+
+    with connection.cursor() as cursor:
+        for table, pkfield, columns in fields:
+            # Do the renamed old columns still exist?  If so, run the task.
+            old_columns = ','.join(f"'{column}_old'" for column in columns)
+            cursor.execute(
+                f"""
+                select count(1) from information_schema.columns
+                where
+                  table_name = %s and column_name in ({old_columns});
+                """,
+                (table,),
+            )
+            if cursor.fetchone()[0]:
+                from awx.main.tasks.system import migrate_jsonfield
+
+                migrate_jsonfield.apply_async([table, pkfield, columns])
 
 
 def cleanup_created_modified_by(sender, **kwargs):
@@ -111,17 +173,17 @@ pre_delete.connect(cleanup_created_modified_by, sender=User)
 
 @property
 def user_get_organizations(user):
-    return Organization.objects.filter(member_role__members=user)
+    return Organization.access_qs(user, 'member')
 
 
 @property
 def user_get_admin_of_organizations(user):
-    return Organization.objects.filter(admin_role__members=user)
+    return Organization.access_qs(user, 'change')
 
 
 @property
 def user_get_auditor_of_organizations(user):
-    return Organization.objects.filter(auditor_role__members=user)
+    return Organization.access_qs(user, 'audit')
 
 
 @property
@@ -135,11 +197,21 @@ User.add_to_class('auditor_of_organizations', user_get_auditor_of_organizations)
 User.add_to_class('created', created)
 
 
+def get_system_auditor_role():
+    rd, created = RoleDefinition.objects.get_or_create(
+        name='Controller System Auditor', defaults={'description': 'Migrated singleton role giving read permission to everything'}
+    )
+    if created:
+        rd.permissions.add(*list(permission_registry.permission_qs.filter(codename__startswith='view')))
+    return rd
+
+
 @property
 def user_is_system_auditor(user):
     if not hasattr(user, '_is_system_auditor'):
         if user.pk:
-            user._is_system_auditor = user.roles.filter(singleton_name='system_auditor', role_field='system_auditor').exists()
+            rd = get_system_auditor_role()
+            user._is_system_auditor = RoleUserAssignment.objects.filter(user=user, role_definition=rd).exists()
         else:
             # Odd case where user is unsaved, this should never be relied on
             return False
@@ -153,48 +225,21 @@ def user_is_system_auditor(user, tf):
         # time they've logged in, and we've just created the new User in this
         # request), we need one to set up the system auditor role
         user.save()
-    if tf:
-        role = Role.singleton('system_auditor')
-        # must check if member to not duplicate activity stream
-        if user not in role.members.all():
-            role.members.add(user)
-        user._is_system_auditor = True
-    else:
-        role = Role.singleton('system_auditor')
-        if user in role.members.all():
-            role.members.remove(user)
-        user._is_system_auditor = False
+    rd = get_system_auditor_role()
+    assignment = RoleUserAssignment.objects.filter(user=user, role_definition=rd).first()
+    prior_value = bool(assignment)
+    if prior_value != bool(tf):
+        if assignment:
+            assignment.delete()
+        else:
+            rd.give_global_permission(user)
+        user._is_system_auditor = bool(tf)
+        entry = ActivityStream.objects.create(changes=json.dumps({"is_system_auditor": [prior_value, bool(tf)]}), object1='user', operation='update')
+        entry.user.add(user)
 
 
 User.add_to_class('is_system_auditor', user_is_system_auditor)
 
-
-def user_is_in_enterprise_category(user, category):
-    ret = (category,) in user.enterprise_auth.values_list('provider') and not user.has_usable_password()
-    # NOTE: this if-else block ensures existing enterprise users are still able to
-    # log in. Remove it in a future release
-    if category == 'radius':
-        ret = ret or not user.has_usable_password()
-    elif category == 'saml':
-        ret = ret or user.social_auth.all()
-    return ret
-
-
-User.add_to_class('is_in_enterprise_category', user_is_in_enterprise_category)
-
-
-def o_auth2_application_get_absolute_url(self, request=None):
-    return reverse('api:o_auth2_application_detail', kwargs={'pk': self.pk}, request=request)
-
-
-OAuth2Application.add_to_class('get_absolute_url', o_auth2_application_get_absolute_url)
-
-
-def o_auth2_token_get_absolute_url(self, request=None):
-    return reverse('api:o_auth2_token_detail', kwargs={'pk': self.pk}, request=request)
-
-
-OAuth2AccessToken.add_to_class('get_absolute_url', o_auth2_token_get_absolute_url)
 
 from awx.main.registrar import activity_stream_registrar  # noqa
 
@@ -217,7 +262,6 @@ activity_stream_registrar.connect(Job)
 activity_stream_registrar.connect(AdHocCommand)
 # activity_stream_registrar.connect(JobHostSummary)
 # activity_stream_registrar.connect(JobEvent)
-# activity_stream_registrar.connect(Profile)
 activity_stream_registrar.connect(Schedule)
 activity_stream_registrar.connect(NotificationTemplate)
 activity_stream_registrar.connect(Notification)
@@ -228,13 +272,10 @@ activity_stream_registrar.connect(WorkflowJobTemplateNode)
 activity_stream_registrar.connect(WorkflowJob)
 activity_stream_registrar.connect(WorkflowApproval)
 activity_stream_registrar.connect(WorkflowApprovalTemplate)
-activity_stream_registrar.connect(OAuth2Application)
-activity_stream_registrar.connect(OAuth2AccessToken)
+
+# Register models
+permission_registry.register(Project, Team, WorkflowJobTemplate, JobTemplate, Inventory, Organization, Credential, NotificationTemplate, ExecutionEnvironment)
+permission_registry.register(InstanceGroup, parent_field_name=None)  # Not part of an organization
 
 # prevent API filtering on certain Django-supplied sensitive fields
 prevent_search(User._meta.get_field('password'))
-prevent_search(OAuth2AccessToken._meta.get_field('token'))
-prevent_search(RefreshToken._meta.get_field('token'))
-prevent_search(OAuth2Application._meta.get_field('client_secret'))
-prevent_search(OAuth2Application._meta.get_field('client_id'))
-prevent_search(Grant._meta.get_field('code'))

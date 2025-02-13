@@ -44,12 +44,13 @@ options:
       type: str
     organization:
       description:
-        - The organization the notification belongs to.
+        - The organization name, ID, or named URL the notification belongs to.
       type: str
     notification_type:
       description:
         - The type of notification to be sent.
       choices:
+        - 'awssns'
         - 'email'
         - 'grafana'
         - 'irc'
@@ -97,7 +98,7 @@ options:
       description:
         - Desired state of the resource.
       default: "present"
-      choices: ["present", "absent"]
+      choices: ["present", "absent", "exists"]
       type: str
 extends_documentation_fragment: awx.awx.auth
 '''
@@ -114,12 +115,12 @@ EXAMPLES = '''
         - general
       token: cefda9e2be1f21d11cdd9452f5b7f97fda977f42
     messages:
-       started:
-         message: "{{ '{{ job_friendly_name }}{{ job.id }} started' }}"
-       success:
-         message: "{{ '{{ job_friendly_name }} completed in {{ job.elapsed }} seconds' }}"
-       error:
-         message: "{{ '{{ job_friendly_name }} FAILED! Please look at {{ job.url }}' }}"
+      started:
+        message: "{{ '{{ job_friendly_name }}{{ job.id }} started' }}"
+      success:
+        message: "{{ '{{ job_friendly_name }} completed in {{ job.elapsed }} seconds' }}"
+      error:
+        message: "{{ '{{ job_friendly_name }} FAILED! Please look at {{ job.url }}' }}"
     state: present
     controller_config_file: "~/tower_cli.cfg"
 
@@ -146,8 +147,8 @@ EXAMPLES = '''
         - user1@example.com
       host: smtp.example.com
       port: 25
-      use_tls: no
-      use_ssl: no
+      use_tls: false
+      use_ssl: false
     state: present
     controller_config_file: "~/tower_cli.cfg"
 
@@ -187,7 +188,7 @@ EXAMPLES = '''
         - user1
       port: 8080
       server: irc.example.com
-      use_ssl: no
+      use_ssl: false
     state: present
     controller_config_file: "~/tower_cli.cfg"
 
@@ -219,10 +220,10 @@ def main():
         copy_from=dict(),
         description=dict(),
         organization=dict(),
-        notification_type=dict(choices=['email', 'grafana', 'irc', 'mattermost', 'pagerduty', 'rocketchat', 'slack', 'twilio', 'webhook']),
+        notification_type=dict(choices=['awssns', 'email', 'grafana', 'irc', 'mattermost', 'pagerduty', 'rocketchat', 'slack', 'twilio', 'webhook']),
         notification_configuration=dict(type='dict'),
         messages=dict(type='dict'),
-        state=dict(choices=['present', 'absent'], default='present'),
+        state=dict(choices=['present', 'absent', 'exists'], default='present'),
     )
 
     # Create a module for ourselves
@@ -248,6 +249,7 @@ def main():
     existing_item = module.get_one(
         'notification_templates',
         name_or_id=name,
+        check_exists=(state == 'exists'),
         **{
             'data': {
                 'organization': organization_id,

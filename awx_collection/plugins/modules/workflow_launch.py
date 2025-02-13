@@ -27,18 +27,28 @@ options:
         - workflow_template
     organization:
       description:
-        - Organization the workflow job template exists in.
+        - Organization name, ID, or named URL the workflow job template exists in.
         - Used to help lookup the object, cannot be modified using this module.
         - If not provided, will lookup by name only, which does not work with duplicates.
       type: str
     inventory:
       description:
-        - Inventory to use for the job ran with this workflow, only used if prompt for inventory is set.
+        - Inventory name, ID, or named URL to use for the job ran with this workflow, only used if prompt for inventory is set.
       type: str
     limit:
       description:
         - Limit to use for the I(job_template).
       type: str
+    tags:
+      description:
+        - Specific tags to apply from the I(job_template).
+      type: list
+      elements: str
+    skip_tags:
+      description:
+        - Specific tags to skip from the I(job_template).
+      type: list
+      elements: str
     scm_branch:
       description:
         - A specific branch of the SCM project to run the template on.
@@ -87,11 +97,10 @@ EXAMPLES = '''
     extra_vars:
       var1: My First Variable
       var2: My Second Variable
-    wait: False
+    wait: false
 '''
 
 from ..module_utils.controller_api import ControllerAPIModule
-import json
 
 
 def main():
@@ -101,11 +110,13 @@ def main():
         organization=dict(),
         inventory=dict(),
         limit=dict(),
+        tags=dict(type='list', elements='str'),
+        skip_tags=dict(type='list', elements='str'),
         scm_branch=dict(),
         extra_vars=dict(type='dict'),
         wait=dict(required=False, default=True, type='bool'),
         interval=dict(required=False, default=2.0, type='float'),
-        timeout=dict(required=False, default=None, type='int'),
+        timeout=dict(required=False, type='int'),
     )
 
     # Create a module for ourselves
@@ -116,15 +127,26 @@ def main():
     name = module.params.get('name')
     organization = module.params.get('organization')
     inventory = module.params.get('inventory')
-    optional_args['limit'] = module.params.get('limit')
     wait = module.params.get('wait')
     interval = module.params.get('interval')
     timeout = module.params.get('timeout')
 
-    # Special treatment of extra_vars parameter
-    extra_vars = module.params.get('extra_vars')
-    if extra_vars is not None:
-        optional_args['extra_vars'] = json.dumps(extra_vars)
+    for field_name in (
+        'limit',
+        'extra_vars',
+        'scm_branch',
+    ):
+        field_val = module.params.get(field_name)
+        if field_val is not None:
+            optional_args[field_name] = field_val
+
+    # Special treatment of tags parameters
+    job_tags = module.params.get('tags')
+    if job_tags is not None:
+        optional_args['job_tags'] = ",".join(job_tags)
+    skip_tags = module.params.get('skip_tags')
+    if skip_tags is not None:
+        optional_args['skip_tags'] = ",".join(skip_tags)
 
     # Create a datastructure to pass into our job launch
     post_data = {}
@@ -150,6 +172,8 @@ def main():
     check_vars_to_prompts = {
         'inventory': 'ask_inventory_on_launch',
         'limit': 'ask_limit_on_launch',
+        'job_tags': 'ask_tags_on_launch',
+        'skip_tags': 'ask_skip_tags_on_launch',
         'scm_branch': 'ask_scm_branch_on_launch',
     }
 

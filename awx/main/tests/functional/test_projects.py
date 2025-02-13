@@ -4,7 +4,7 @@ from unittest import mock  # noqa
 import pytest
 
 from awx.api.versioning import reverse
-from awx.main.models import Project
+from awx.main.models import Project, JobTemplate
 
 from django.core.exceptions import ValidationError
 
@@ -335,7 +335,7 @@ def test_team_project_list(get, team_project_list):
 
 
 @pytest.mark.parametrize("u,expected_status_code", [('rando', 403), ('org_member', 403), ('org_admin', 201), ('admin', 201)])
-@pytest.mark.django_db()
+@pytest.mark.django_db
 def test_create_project(post, organization, org_admin, org_member, admin, rando, u, expected_status_code):
     if u == 'rando':
         u = rando
@@ -353,11 +353,12 @@ def test_create_project(post, organization, org_admin, org_member, admin, rando,
             'organization': organization.id,
         },
         u,
+        expect=expected_status_code,
     )
-    print(result.data)
-    assert result.status_code == expected_status_code
     if expected_status_code == 201:
         assert Project.objects.filter(name='Project', organization=organization).exists()
+    elif expected_status_code == 403:
+        assert 'do not have permission' in str(result.data['detail'])
 
 
 @pytest.mark.django_db
@@ -411,14 +412,14 @@ def test_project_delete(delete, organization, admin_user):
 
 
 @pytest.mark.parametrize(
-    'order_by, expected_names, expected_ids',
+    'order_by, expected_names',
     [
-        ('name', ['alice project', 'bob project', 'shared project'], [1, 2, 3]),
-        ('-name', ['shared project', 'bob project', 'alice project'], [3, 2, 1]),
+        ('name', ['alice project', 'bob project', 'shared project']),
+        ('-name', ['shared project', 'bob project', 'alice project']),
     ],
 )
 @pytest.mark.django_db
-def test_project_list_ordering_by_name(get, order_by, expected_names, expected_ids, organization_factory):
+def test_project_list_ordering_by_name(get, order_by, expected_names, organization_factory):
     'ensure sorted order of project list is maintained correctly when the requested order is invalid or not applicable'
     objects = organization_factory(
         'org1',
@@ -426,13 +427,11 @@ def test_project_list_ordering_by_name(get, order_by, expected_names, expected_i
         superusers=['admin'],
     )
     project_names = []
-    project_ids = []
     # TODO: ask for an order by here that doesn't apply
     results = get(reverse('api:project_list'), objects.superusers.admin, QUERY_STRING='order_by=%s' % order_by).data['results']
     for x in range(len(results)):
         project_names.append(results[x]['name'])
-        project_ids.append(results[x]['id'])
-    assert project_names == expected_names and project_ids == expected_ids
+    assert project_names == expected_names
 
 
 @pytest.mark.parametrize('order_by', ('name', '-name'))
@@ -450,4 +449,21 @@ def test_project_list_ordering_with_duplicate_names(get, order_by, organization_
     for x in range(3):
         results = get(reverse('api:project_list'), objects.superusers.admin, QUERY_STRING='order_by=%s' % order_by).data['results']
         project_ids[x] = [proj['id'] for proj in results]
-    assert project_ids[0] == project_ids[1] == project_ids[2] == [1, 2, 3, 4, 5]
+    assert project_ids[0] == project_ids[1] == project_ids[2]
+    assert project_ids[0] == sorted(project_ids[0])
+
+
+@pytest.mark.django_db
+def test_project_failed_update(post, project, admin, inventory):
+    """Test to ensure failed projects with update on launch will create launch rather than error"""
+    jt = JobTemplate.objects.create(project=project, inventory=inventory)
+    # set project to update on launch and set status to failed
+    project.update_fields(scm_update_on_launch=True)
+    project.update()
+    project.project_updates.last().update_fields(status='failed')
+    response = post(reverse('api:job_template_launch', kwargs={'pk': jt.pk}), user=admin, expect=201)
+    assert response.status_code == 201
+    # set project to not update on launch and validate still 400's
+    project.update_fields(scm_update_on_launch=False)
+    response = post(reverse('api:job_template_launch', kwargs={'pk': jt.pk}), user=admin, expect=400)
+    assert response.status_code == 400

@@ -15,7 +15,6 @@ logger = logging.getLogger('awx.main.notifications.twilio_backend')
 
 
 class TwilioBackend(AWXBaseEmailBackend, CustomNotificationBase):
-
     init_parameters = {
         "account_sid": {"label": "Account SID", "type": "string"},
         "account_token": {"label": "Account Token", "type": "password"},
@@ -40,11 +39,15 @@ class TwilioBackend(AWXBaseEmailBackend, CustomNotificationBase):
             logger.error(smart_str(_("Exception connecting to Twilio: {}").format(e)))
 
         for m in messages:
-            try:
-                connection.messages.create(to=m.to, from_=m.from_email, body=m.subject)
-                sent_messages += 1
-            except Exception as e:
-                logger.error(smart_str(_("Exception sending messages: {}").format(e)))
-                if not self.fail_silently:
-                    raise
+            failed = False
+            for dest in m.to:
+                try:
+                    logger.debug(smart_str(_("FROM: {} / TO: {}").format(m.from_email, dest)))
+                    connection.messages.create(to=dest, from_=m.from_email, body=m.subject)
+                    sent_messages += 1
+                except Exception as e:
+                    logger.error(smart_str(_("Exception sending messages: {}").format(e)))
+                    failed = True
+            if not self.fail_silently and failed:
+                raise
         return sent_messages

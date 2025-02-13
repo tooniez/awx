@@ -6,12 +6,9 @@ import copy
 import json
 import logging
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import timedelta
-
-# OAuth2
-from oauthlib import oauth2
-from oauthlib.common import generate_token
+from uuid import uuid4
 
 # Jinja
 from jinja2 import sandbox, StrictUndefined
@@ -42,9 +39,14 @@ from rest_framework.utils.serializer_helpers import ReturnList
 # Django-Polymorphic
 from polymorphic.models import PolymorphicModel
 
+# django-ansible-base
+from ansible_base.lib.utils.models import get_type_for_model
+from ansible_base.rbac.models import RoleEvaluation, ObjectRole
+from ansible_base.rbac import permission_registry
+
 # AWX
 from awx.main.access import get_user_capabilities
-from awx.main.constants import ACTIVE_STATES, CENSOR_VALUE
+from awx.main.constants import ACTIVE_STATES, org_role_to_permission
 from awx.main.models import (
     ActivityStream,
     AdHocCommand,
@@ -55,6 +57,8 @@ from awx.main.models import (
     ExecutionEnvironment,
     Group,
     Host,
+    HostMetric,
+    HostMetricSummaryMonthly,
     Instance,
     InstanceGroup,
     InstanceLink,
@@ -71,13 +75,11 @@ from awx.main.models import (
     Label,
     Notification,
     NotificationTemplate,
-    OAuth2AccessToken,
-    OAuth2Application,
     Organization,
     Project,
     ProjectUpdate,
     ProjectUpdateEvent,
-    RefreshToken,
+    ReceptorAddress,
     Role,
     Schedule,
     SystemJob,
@@ -93,13 +95,11 @@ from awx.main.models import (
     WorkflowJobTemplate,
     WorkflowJobTemplateNode,
     StdoutMaxBytesExceeded,
-    CLOUD_INVENTORY_SOURCES,
 )
 from awx.main.models.base import VERBOSITY_CHOICES, NEW_JOB_TYPE_CHOICES
-from awx.main.models.rbac import get_roles_on_resource, role_summary_fields_generator
+from awx.main.models.rbac import role_summary_fields_generator, give_creator_permissions, get_role_codenames, to_permissions, get_role_from_object_role
 from awx.main.fields import ImplicitRoleField
 from awx.main.utils import (
-    get_type_for_model,
     get_model_for_type,
     camelcase_to_underscore,
     getattrd,
@@ -108,13 +108,17 @@ from awx.main.utils import (
     extract_ansible_vars,
     encrypt_dict,
     prefetch_page_capabilities,
-    get_external_account,
     truncate_stdout,
+    get_licenser,
 )
+
 from awx.main.utils.filters import SmartFilter
+from awx.main.utils.plugins import load_combined_inventory_source_options
 from awx.main.utils.named_url_graph import reset_counters
 from awx.main.scheduler.task_manager_models import TaskManagerModels
 from awx.main.redact import UriCleaner, REPLACE_STR
+from awx.main.signals import update_inventory_computed_fields
+
 
 from awx.main.validators import vars_validate_or_raise
 
@@ -151,11 +155,12 @@ SUMMARIZABLE_FK_FIELDS = {
         'kind',
     ),
     'host': DEFAULT_SUMMARY_FIELDS,
+    'constructed_host': DEFAULT_SUMMARY_FIELDS,
     'group': DEFAULT_SUMMARY_FIELDS,
     'default_environment': DEFAULT_SUMMARY_FIELDS + ('image',),
     'execution_environment': DEFAULT_SUMMARY_FIELDS + ('image',),
     'project': DEFAULT_SUMMARY_FIELDS + ('status', 'scm_type', 'allow_override'),
-    'source_project': DEFAULT_SUMMARY_FIELDS + ('status', 'scm_type'),
+    'source_project': DEFAULT_SUMMARY_FIELDS + ('status', 'scm_type', 'allow_override'),
     'project_update': DEFAULT_SUMMARY_FIELDS + ('status', 'failed'),
     'credential': DEFAULT_SUMMARY_FIELDS + ('kind', 'cloud', 'kubernetes', 'credential_type_id'),
     'signature_validation_credential': DEFAULT_SUMMARY_FIELDS + ('kind', 'credential_type_id'),
@@ -181,7 +186,13 @@ SUMMARIZABLE_FK_FIELDS = {
     'webhook_credential': DEFAULT_SUMMARY_FIELDS + ('kind', 'cloud', 'credential_type_id'),
     'approved_or_denied_by': ('id', 'username', 'first_name', 'last_name'),
     'credential_type': DEFAULT_SUMMARY_FIELDS,
+    'resource': ('ansible_id', 'resource_type'),
 }
+
+
+# These fields can be edited on a constructed inventory's generated source (possibly by using the constructed
+# inventory's special API endpoint, but also by using the inventory sources endpoint).
+CONSTRUCTED_INVENTORY_SOURCE_EDITABLE_FIELDS = ('source_vars', 'update_cache_timeout', 'limit', 'verbosity')
 
 
 def reverse_gfk(content_object, request):
@@ -200,7 +211,6 @@ def reverse_gfk(content_object, request):
 
 
 class CopySerializer(serializers.Serializer):
-
     name = serializers.CharField()
 
     def validate(self, attrs):
@@ -208,7 +218,7 @@ class CopySerializer(serializers.Serializer):
         view = self.context.get('view', None)
         obj = view.get_object()
         if name == obj.name:
-            raise serializers.ValidationError(_('The original object is already named {}, a copy from' ' it cannot have the same name.'.format(name)))
+            raise serializers.ValidationError(_('The original object is already named {}, a copy from it cannot have the same name.'.format(name)))
         return attrs
 
 
@@ -432,7 +442,6 @@ class BaseSerializer(serializers.ModelSerializer, metaclass=BaseSerializerMetacl
                     continue
                 summary_fields[fk] = OrderedDict()
                 for field in related_fields:
-
                     fval = getattr(fkval, field, None)
 
                     if fval is None and field == 'type':
@@ -538,7 +547,7 @@ class BaseSerializer(serializers.ModelSerializer, metaclass=BaseSerializerMetacl
         #
         # This logic is to force rendering choice's on an uneditable field.
         # Note: Consider expanding this rendering for more than just choices fields
-        # Note: This logic works in conjuction with
+        # Note: This logic works in conjunction with
         if hasattr(model_field, 'choices') and model_field.choices:
             was_editable = model_field.editable
             model_field.editable = True
@@ -624,7 +633,7 @@ class BaseSerializer(serializers.ModelSerializer, metaclass=BaseSerializerMetacl
             exclusions = self.get_validation_exclusions(self.instance)
             obj = self.instance or self.Meta.model()
             for k, v in attrs.items():
-                if k not in exclusions:
+                if k not in exclusions and k != 'canonical_address_port':
                     setattr(obj, k, v)
             obj.full_clean(exclude=exclusions)
             # full_clean may modify values on the instance; copy those changes
@@ -749,7 +758,7 @@ class UnifiedJobTemplateSerializer(BaseSerializer):
 class UnifiedJobSerializer(BaseSerializer):
     show_capabilities = ['start', 'delete']
     event_processing_finished = serializers.BooleanField(
-        help_text=_('Indicates whether all of the events generated by this ' 'unified job have been saved to the database.'), read_only=True
+        help_text=_('Indicates whether all of the events generated by this unified job have been saved to the database.'), read_only=True
     )
 
     class Meta:
@@ -930,7 +939,6 @@ class UnifiedJobListSerializer(UnifiedJobSerializer):
 
 
 class UnifiedJobStdoutSerializer(UnifiedJobSerializer):
-
     result_stdout = serializers.SerializerMethodField()
 
     class Meta:
@@ -944,10 +952,7 @@ class UnifiedJobStdoutSerializer(UnifiedJobSerializer):
 
 
 class UserSerializer(BaseSerializer):
-
-    password = serializers.CharField(required=False, default='', write_only=True, help_text=_('Write-only field used to change the password.'))
-    ldap_dn = serializers.CharField(source='profile.ldap_dn', read_only=True)
-    external_account = serializers.SerializerMethodField(help_text=_('Set if the account is managed by an external service'))
+    password = serializers.CharField(required=False, default='', help_text=_('Field used to change the password.'))
     is_system_auditor = serializers.BooleanField(default=False)
     show_capabilities = ['edit', 'delete']
 
@@ -964,17 +969,13 @@ class UserSerializer(BaseSerializer):
             'is_superuser',
             'is_system_auditor',
             'password',
-            'ldap_dn',
             'last_login',
-            'external_account',
         )
         extra_kwargs = {'last_login': {'read_only': True}}
 
     def to_representation(self, obj):
         ret = super(UserSerializer, self).to_representation(obj)
-        ret.pop('password', None)
-        if obj and type(self) is UserSerializer:
-            ret['auth'] = obj.social_auth.values('provider', 'uid')
+        ret['password'] = '$encrypted$'
         return ret
 
     def get_validation_exclusions(self, obj=None):
@@ -986,28 +987,28 @@ class UserSerializer(BaseSerializer):
         django_validate_password(value)
         if not self.instance and value in (None, ''):
             raise serializers.ValidationError(_('Password required for new User.'))
+
+        # Check if a password is too long
+        password_max_length = User._meta.get_field('password').max_length
+        if len(value) > password_max_length:
+            raise serializers.ValidationError(_('Password max length is {}'.format(password_max_length)))
+        if getattr(settings, 'LOCAL_PASSWORD_MIN_LENGTH', 0) and len(value) < getattr(settings, 'LOCAL_PASSWORD_MIN_LENGTH'):
+            raise serializers.ValidationError(_('Password must be at least {} characters long.'.format(getattr(settings, 'LOCAL_PASSWORD_MIN_LENGTH'))))
+        if getattr(settings, 'LOCAL_PASSWORD_MIN_DIGITS', 0) and sum(c.isdigit() for c in value) < getattr(settings, 'LOCAL_PASSWORD_MIN_DIGITS'):
+            raise serializers.ValidationError(_('Password must contain at least {} digits.'.format(getattr(settings, 'LOCAL_PASSWORD_MIN_DIGITS'))))
+        if getattr(settings, 'LOCAL_PASSWORD_MIN_UPPER', 0) and sum(c.isupper() for c in value) < getattr(settings, 'LOCAL_PASSWORD_MIN_UPPER'):
+            raise serializers.ValidationError(
+                _('Password must contain at least {} uppercase characters.'.format(getattr(settings, 'LOCAL_PASSWORD_MIN_UPPER')))
+            )
+        if getattr(settings, 'LOCAL_PASSWORD_MIN_SPECIAL', 0) and sum(not c.isalnum() for c in value) < getattr(settings, 'LOCAL_PASSWORD_MIN_SPECIAL'):
+            raise serializers.ValidationError(
+                _('Password must contain at least {} special characters.'.format(getattr(settings, 'LOCAL_PASSWORD_MIN_SPECIAL')))
+            )
+
         return value
 
     def _update_password(self, obj, new_password):
-        # For now we're not raising an error, just not saving password for
-        # users managed by LDAP who already have an unusable password set.
-        if getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
-            try:
-                if obj.pk and obj.profile.ldap_dn and not obj.has_usable_password():
-                    new_password = None
-            except AttributeError:
-                pass
-        if (
-            getattr(settings, 'SOCIAL_AUTH_GOOGLE_OAUTH2_KEY', None)
-            or getattr(settings, 'SOCIAL_AUTH_GITHUB_KEY', None)
-            or getattr(settings, 'SOCIAL_AUTH_GITHUB_ORG_KEY', None)
-            or getattr(settings, 'SOCIAL_AUTH_GITHUB_TEAM_KEY', None)
-            or getattr(settings, 'SOCIAL_AUTH_SAML_ENABLED_IDPS', None)
-        ) and obj.social_auth.all():
-            new_password = None
-        if (getattr(settings, 'RADIUS_SERVER', None) or getattr(settings, 'TACACSPLUS_HOST', None)) and obj.enterprise_auth.all():
-            new_password = None
-        if new_password:
+        if new_password and new_password != '$encrypted$':
             obj.set_password(new_password)
             obj.save(update_fields=['password'])
 
@@ -1015,13 +1016,12 @@ class UserSerializer(BaseSerializer):
             # as the modified user then inject a session key derived from
             # the updated user to prevent logout. This is the logic used by
             # the Django admin's own user_change_password view.
-            update_session_auth_hash(self.context['request'], obj)
+            if self.instance and self.context['request'].user.username == obj.username:
+                update_session_auth_hash(self.context['request'], obj)
+
         elif not obj.password:
             obj.set_unusable_password()
             obj.save(update_fields=['password'])
-
-    def get_external_account(self, obj):
-        return get_external_account(obj)
 
     def create(self, validated_data):
         new_password = validated_data.pop('password', None)
@@ -1053,43 +1053,9 @@ class UserSerializer(BaseSerializer):
                 roles=self.reverse('api:user_roles_list', kwargs={'pk': obj.pk}),
                 activity_stream=self.reverse('api:user_activity_stream_list', kwargs={'pk': obj.pk}),
                 access_list=self.reverse('api:user_access_list', kwargs={'pk': obj.pk}),
-                tokens=self.reverse('api:o_auth2_token_list', kwargs={'pk': obj.pk}),
-                authorized_tokens=self.reverse('api:user_authorized_token_list', kwargs={'pk': obj.pk}),
-                personal_tokens=self.reverse('api:user_personal_token_list', kwargs={'pk': obj.pk}),
             )
         )
         return res
-
-    def _validate_ldap_managed_field(self, value, field_name):
-        if not getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
-            return value
-        try:
-            is_ldap_user = bool(self.instance and self.instance.profile.ldap_dn)
-        except AttributeError:
-            is_ldap_user = False
-        if is_ldap_user:
-            ldap_managed_fields = ['username']
-            ldap_managed_fields.extend(getattr(settings, 'AUTH_LDAP_USER_ATTR_MAP', {}).keys())
-            ldap_managed_fields.extend(getattr(settings, 'AUTH_LDAP_USER_FLAGS_BY_GROUP', {}).keys())
-            if field_name in ldap_managed_fields:
-                if value != getattr(self.instance, field_name):
-                    raise serializers.ValidationError(_('Unable to change %s on user managed by LDAP.') % field_name)
-        return value
-
-    def validate_username(self, value):
-        return self._validate_ldap_managed_field(value, 'username')
-
-    def validate_first_name(self, value):
-        return self._validate_ldap_managed_field(value, 'first_name')
-
-    def validate_last_name(self, value):
-        return self._validate_ldap_managed_field(value, 'last_name')
-
-    def validate_email(self, value):
-        return self._validate_ldap_managed_field(value, 'email')
-
-    def validate_is_superuser(self, value):
-        return self._validate_ldap_managed_field(value, 'is_superuser')
 
 
 class UserActivityStreamSerializer(UserSerializer):
@@ -1101,201 +1067,6 @@ class UserActivityStreamSerializer(UserSerializer):
     class Meta:
         model = User
         fields = ('*', '-is_system_auditor')
-
-
-class BaseOAuth2TokenSerializer(BaseSerializer):
-
-    refresh_token = serializers.SerializerMethodField()
-    token = serializers.SerializerMethodField()
-    ALLOWED_SCOPES = ['read', 'write']
-
-    class Meta:
-        model = OAuth2AccessToken
-        fields = ('*', '-name', 'description', 'user', 'token', 'refresh_token', 'application', 'expires', 'scope')
-        read_only_fields = ('user', 'token', 'expires', 'refresh_token')
-        extra_kwargs = {'scope': {'allow_null': False, 'required': False}, 'user': {'allow_null': False, 'required': True}}
-
-    def get_token(self, obj):
-        request = self.context.get('request', None)
-        try:
-            if request.method == 'POST':
-                return obj.token
-            else:
-                return CENSOR_VALUE
-        except ObjectDoesNotExist:
-            return ''
-
-    def get_refresh_token(self, obj):
-        request = self.context.get('request', None)
-        try:
-            if not obj.refresh_token:
-                return None
-            elif request.method == 'POST':
-                return getattr(obj.refresh_token, 'token', '')
-            else:
-                return CENSOR_VALUE
-        except ObjectDoesNotExist:
-            return None
-
-    def get_related(self, obj):
-        ret = super(BaseOAuth2TokenSerializer, self).get_related(obj)
-        if obj.user:
-            ret['user'] = self.reverse('api:user_detail', kwargs={'pk': obj.user.pk})
-        if obj.application:
-            ret['application'] = self.reverse('api:o_auth2_application_detail', kwargs={'pk': obj.application.pk})
-        ret['activity_stream'] = self.reverse('api:o_auth2_token_activity_stream_list', kwargs={'pk': obj.pk})
-        return ret
-
-    def _is_valid_scope(self, value):
-        if not value or (not isinstance(value, str)):
-            return False
-        words = value.split()
-        for word in words:
-            if words.count(word) > 1:
-                return False  # do not allow duplicates
-            if word not in self.ALLOWED_SCOPES:
-                return False
-        return True
-
-    def validate_scope(self, value):
-        if not self._is_valid_scope(value):
-            raise serializers.ValidationError(_('Must be a simple space-separated string with allowed scopes {}.').format(self.ALLOWED_SCOPES))
-        return value
-
-    def create(self, validated_data):
-        validated_data['user'] = self.context['request'].user
-        try:
-            return super(BaseOAuth2TokenSerializer, self).create(validated_data)
-        except oauth2.AccessDeniedError as e:
-            raise PermissionDenied(str(e))
-
-
-class UserAuthorizedTokenSerializer(BaseOAuth2TokenSerializer):
-    class Meta:
-        extra_kwargs = {
-            'scope': {'allow_null': False, 'required': False},
-            'user': {'allow_null': False, 'required': True},
-            'application': {'allow_null': False, 'required': True},
-        }
-
-    def create(self, validated_data):
-        current_user = self.context['request'].user
-        validated_data['token'] = generate_token()
-        validated_data['expires'] = now() + timedelta(seconds=settings.OAUTH2_PROVIDER['ACCESS_TOKEN_EXPIRE_SECONDS'])
-        obj = super(UserAuthorizedTokenSerializer, self).create(validated_data)
-        obj.save()
-        if obj.application:
-            RefreshToken.objects.create(user=current_user, token=generate_token(), application=obj.application, access_token=obj)
-        return obj
-
-
-class OAuth2TokenSerializer(BaseOAuth2TokenSerializer):
-    def create(self, validated_data):
-        current_user = self.context['request'].user
-        validated_data['token'] = generate_token()
-        validated_data['expires'] = now() + timedelta(seconds=settings.OAUTH2_PROVIDER['ACCESS_TOKEN_EXPIRE_SECONDS'])
-        obj = super(OAuth2TokenSerializer, self).create(validated_data)
-        if obj.application and obj.application.user:
-            obj.user = obj.application.user
-        obj.save()
-        if obj.application:
-            RefreshToken.objects.create(user=current_user, token=generate_token(), application=obj.application, access_token=obj)
-        return obj
-
-
-class OAuth2TokenDetailSerializer(OAuth2TokenSerializer):
-    class Meta:
-        read_only_fields = ('*', 'user', 'application')
-
-
-class UserPersonalTokenSerializer(BaseOAuth2TokenSerializer):
-    class Meta:
-        read_only_fields = ('user', 'token', 'expires', 'application')
-
-    def create(self, validated_data):
-        validated_data['token'] = generate_token()
-        validated_data['expires'] = now() + timedelta(seconds=settings.OAUTH2_PROVIDER['ACCESS_TOKEN_EXPIRE_SECONDS'])
-        validated_data['application'] = None
-        obj = super(UserPersonalTokenSerializer, self).create(validated_data)
-        obj.save()
-        return obj
-
-
-class OAuth2ApplicationSerializer(BaseSerializer):
-
-    show_capabilities = ['edit', 'delete']
-
-    class Meta:
-        model = OAuth2Application
-        fields = (
-            '*',
-            'description',
-            '-user',
-            'client_id',
-            'client_secret',
-            'client_type',
-            'redirect_uris',
-            'authorization_grant_type',
-            'skip_authorization',
-            'organization',
-        )
-        read_only_fields = ('client_id', 'client_secret')
-        read_only_on_update_fields = ('user', 'authorization_grant_type')
-        extra_kwargs = {
-            'user': {'allow_null': True, 'required': False},
-            'organization': {'allow_null': False},
-            'authorization_grant_type': {'allow_null': False, 'label': _('Authorization Grant Type')},
-            'client_secret': {'label': _('Client Secret')},
-            'client_type': {'label': _('Client Type')},
-            'redirect_uris': {'label': _('Redirect URIs')},
-            'skip_authorization': {'label': _('Skip Authorization')},
-        }
-
-    def to_representation(self, obj):
-        ret = super(OAuth2ApplicationSerializer, self).to_representation(obj)
-        request = self.context.get('request', None)
-        if request.method != 'POST' and obj.client_type == 'confidential':
-            ret['client_secret'] = CENSOR_VALUE
-        if obj.client_type == 'public':
-            ret.pop('client_secret', None)
-        return ret
-
-    def get_related(self, obj):
-        res = super(OAuth2ApplicationSerializer, self).get_related(obj)
-        res.update(
-            dict(
-                tokens=self.reverse('api:o_auth2_application_token_list', kwargs={'pk': obj.pk}),
-                activity_stream=self.reverse('api:o_auth2_application_activity_stream_list', kwargs={'pk': obj.pk}),
-            )
-        )
-        if obj.organization_id:
-            res.update(
-                dict(
-                    organization=self.reverse('api:organization_detail', kwargs={'pk': obj.organization_id}),
-                )
-            )
-        return res
-
-    def get_modified(self, obj):
-        if obj is None:
-            return None
-        return obj.updated
-
-    def _summary_field_tokens(self, obj):
-        token_list = [{'id': x.pk, 'token': CENSOR_VALUE, 'scope': x.scope} for x in obj.oauth2accesstoken_set.all()[:10]]
-        if has_model_field_prefetched(obj, 'oauth2accesstoken_set'):
-            token_count = len(obj.oauth2accesstoken_set.all())
-        else:
-            if len(token_list) < 10:
-                token_count = len(token_list)
-            else:
-                token_count = obj.oauth2accesstoken_set.count()
-        return {'count': token_count, 'results': token_list}
-
-    def get_summary_fields(self, obj):
-        ret = super(OAuth2ApplicationSerializer, self).get_summary_fields(obj)
-        ret['tokens'] = self._summary_field_tokens(obj)
-        return ret
 
 
 class OrganizationSerializer(BaseSerializer):
@@ -1318,7 +1089,6 @@ class OrganizationSerializer(BaseSerializer):
             admins=self.reverse('api:organization_admins_list', kwargs={'pk': obj.pk}),
             teams=self.reverse('api:organization_teams_list', kwargs={'pk': obj.pk}),
             credentials=self.reverse('api:organization_credential_list', kwargs={'pk': obj.pk}),
-            applications=self.reverse('api:organization_applications_list', kwargs={'pk': obj.pk}),
             activity_stream=self.reverse('api:organization_activity_stream_list', kwargs={'pk': obj.pk}),
             notification_templates=self.reverse('api:organization_notification_templates_list', kwargs={'pk': obj.pk}),
             notification_templates_started=self.reverse('api:organization_notification_templates_started_list', kwargs={'pk': obj.pk}),
@@ -1457,7 +1227,6 @@ class ExecutionEnvironmentSerializer(BaseSerializer):
 
 
 class ProjectSerializer(UnifiedJobTemplateSerializer, ProjectOptionsSerializer):
-
     status = serializers.ChoiceField(choices=Project.PROJECT_STATUS_CHOICES, read_only=True)
     last_update_failed = serializers.BooleanField(read_only=True)
     last_updated = serializers.DateTimeField(read_only=True)
@@ -1548,7 +1317,6 @@ class ProjectSerializer(UnifiedJobTemplateSerializer, ProjectOptionsSerializer):
 
 
 class ProjectPlaybooksSerializer(ProjectSerializer):
-
     playbooks = serializers.SerializerMethodField(help_text=_('Array of playbooks available within this project.'))
 
     class Meta:
@@ -1566,8 +1334,7 @@ class ProjectPlaybooksSerializer(ProjectSerializer):
 
 
 class ProjectInventoriesSerializer(ProjectSerializer):
-
-    inventory_files = serializers.ReadOnlyField(help_text=_('Array of inventory files and directories available within this project, ' 'not comprehensive.'))
+    inventory_files = serializers.ReadOnlyField(help_text=_('Array of inventory files and directories available within this project, not comprehensive.'))
 
     class Meta:
         model = Project
@@ -1581,7 +1348,6 @@ class ProjectInventoriesSerializer(ProjectSerializer):
 
 
 class ProjectUpdateViewSerializer(ProjectSerializer):
-
     can_update = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -1611,7 +1377,6 @@ class ProjectUpdateSerializer(UnifiedJobSerializer, ProjectOptionsSerializer):
 
 
 class ProjectUpdateDetailSerializer(ProjectUpdateSerializer):
-
     playbook_counts = serializers.SerializerMethodField(help_text=_('A count of all plays and tasks for the job run.'))
 
     class Meta:
@@ -1619,8 +1384,8 @@ class ProjectUpdateDetailSerializer(ProjectUpdateSerializer):
         fields = ('*', 'host_status_counts', 'playbook_counts')
 
     def get_playbook_counts(self, obj):
-        task_count = obj.project_update_events.filter(event='playbook_on_task_start').count()
-        play_count = obj.project_update_events.filter(event='playbook_on_play_start').count()
+        task_count = obj.get_event_queryset().filter(event='playbook_on_task_start').count()
+        play_count = obj.get_event_queryset().filter(event='playbook_on_play_start').count()
 
         data = {'play_count': play_count, 'task_count': task_count}
 
@@ -1634,7 +1399,6 @@ class ProjectUpdateListSerializer(ProjectUpdateSerializer, UnifiedJobListSeriali
 
 
 class ProjectUpdateCancelSerializer(ProjectUpdateSerializer):
-
     can_cancel = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -1692,13 +1456,8 @@ class InventorySerializer(LabelsListMixin, BaseSerializerWithVariables):
         res.update(
             dict(
                 hosts=self.reverse('api:inventory_hosts_list', kwargs={'pk': obj.pk}),
-                groups=self.reverse('api:inventory_groups_list', kwargs={'pk': obj.pk}),
-                root_groups=self.reverse('api:inventory_root_groups_list', kwargs={'pk': obj.pk}),
                 variable_data=self.reverse('api:inventory_variable_data', kwargs={'pk': obj.pk}),
                 script=self.reverse('api:inventory_script_view', kwargs={'pk': obj.pk}),
-                tree=self.reverse('api:inventory_tree_view', kwargs={'pk': obj.pk}),
-                inventory_sources=self.reverse('api:inventory_inventory_sources_list', kwargs={'pk': obj.pk}),
-                update_inventory_sources=self.reverse('api:inventory_inventory_sources_update', kwargs={'pk': obj.pk}),
                 activity_stream=self.reverse('api:inventory_activity_stream_list', kwargs={'pk': obj.pk}),
                 job_templates=self.reverse('api:inventory_job_template_list', kwargs={'pk': obj.pk}),
                 ad_hoc_commands=self.reverse('api:inventory_ad_hoc_commands_list', kwargs={'pk': obj.pk}),
@@ -1709,8 +1468,18 @@ class InventorySerializer(LabelsListMixin, BaseSerializerWithVariables):
                 labels=self.reverse('api:inventory_label_list', kwargs={'pk': obj.pk}),
             )
         )
+        if obj.kind in ('', 'constructed'):
+            # links not relevant for the "old" smart inventory
+            res['groups'] = self.reverse('api:inventory_groups_list', kwargs={'pk': obj.pk})
+            res['root_groups'] = self.reverse('api:inventory_root_groups_list', kwargs={'pk': obj.pk})
+            res['update_inventory_sources'] = self.reverse('api:inventory_inventory_sources_update', kwargs={'pk': obj.pk})
+            res['inventory_sources'] = self.reverse('api:inventory_inventory_sources_list', kwargs={'pk': obj.pk})
+            res['tree'] = self.reverse('api:inventory_tree_view', kwargs={'pk': obj.pk})
         if obj.organization:
             res['organization'] = self.reverse('api:organization_detail', kwargs={'pk': obj.organization.pk})
+        if obj.kind == 'constructed':
+            res['input_inventories'] = self.reverse('api:inventory_input_inventories', kwargs={'pk': obj.pk})
+            res['constructed_url'] = self.reverse('api:constructed_inventory_detail', kwargs={'pk': obj.pk})
         return res
 
     def to_representation(self, obj):
@@ -1750,6 +1519,91 @@ class InventorySerializer(LabelsListMixin, BaseSerializerWithVariables):
         if kind == 'smart' and not host_filter:
             raise serializers.ValidationError({'host_filter': _('Smart inventories must specify host_filter')})
         return super(InventorySerializer, self).validate(attrs)
+
+
+class ConstructedFieldMixin(serializers.Field):
+    def get_attribute(self, instance):
+        if not hasattr(instance, '_constructed_inv_src'):
+            instance._constructed_inv_src = instance.inventory_sources.first()
+        inv_src = instance._constructed_inv_src
+        return super().get_attribute(inv_src)  # yoink
+
+
+class ConstructedCharField(ConstructedFieldMixin, serializers.CharField):
+    pass
+
+
+class ConstructedIntegerField(ConstructedFieldMixin, serializers.IntegerField):
+    pass
+
+
+class ConstructedInventorySerializer(InventorySerializer):
+    source_vars = ConstructedCharField(
+        required=False,
+        default=None,
+        allow_blank=True,
+        help_text=_('The source_vars for the related auto-created inventory source, special to constructed inventory.'),
+    )
+    update_cache_timeout = ConstructedIntegerField(
+        required=False,
+        allow_null=True,
+        min_value=0,
+        default=None,
+        help_text=_('The cache timeout for the related auto-created inventory source, special to constructed inventory'),
+    )
+    limit = ConstructedCharField(
+        required=False,
+        default=None,
+        allow_blank=True,
+        help_text=_('The limit to restrict the returned hosts for the related auto-created inventory source, special to constructed inventory.'),
+    )
+    verbosity = ConstructedIntegerField(
+        required=False,
+        allow_null=True,
+        min_value=0,
+        max_value=5,
+        default=None,
+        help_text=_('The verbosity level for the related auto-created inventory source, special to constructed inventory'),
+    )
+
+    class Meta:
+        model = Inventory
+        fields = ('*', '-host_filter') + CONSTRUCTED_INVENTORY_SOURCE_EDITABLE_FIELDS
+        read_only_fields = ('*', 'kind')
+
+    def pop_inv_src_data(self, data):
+        inv_src_data = {}
+        for field in CONSTRUCTED_INVENTORY_SOURCE_EDITABLE_FIELDS:
+            if field in data:
+                # values always need to be removed, as they are not valid for Inventory model
+                value = data.pop(field)
+                # null is not valid for any of those fields, taken as not-provided
+                if value is not None:
+                    inv_src_data[field] = value
+        return inv_src_data
+
+    def apply_inv_src_data(self, inventory, inv_src_data):
+        if inv_src_data:
+            update_fields = []
+            inv_src = inventory.inventory_sources.first()
+            for field, value in inv_src_data.items():
+                setattr(inv_src, field, value)
+                update_fields.append(field)
+            if update_fields:
+                inv_src.save(update_fields=update_fields)
+
+    def create(self, validated_data):
+        validated_data['kind'] = 'constructed'
+        inv_src_data = self.pop_inv_src_data(validated_data)
+        inventory = super().create(validated_data)
+        self.apply_inv_src_data(inventory, inv_src_data)
+        return inventory
+
+    def update(self, obj, validated_data):
+        inv_src_data = self.pop_inv_src_data(validated_data)
+        obj = super().update(obj, validated_data)
+        self.apply_inv_src_data(obj, inv_src_data)
+        return obj
 
 
 class InventoryScriptSerializer(InventorySerializer):
@@ -1805,6 +1659,9 @@ class HostSerializer(BaseSerializerWithVariables):
                 ansible_facts=self.reverse('api:host_ansible_facts_detail', kwargs={'pk': obj.pk}),
             )
         )
+        if obj.inventory.kind == 'constructed':
+            res['original_host'] = self.reverse('api:host_detail', kwargs={'pk': obj.instance_id})
+            res['ansible_facts'] = self.reverse('api:host_ansible_facts_detail', kwargs={'pk': obj.instance_id})
         if obj.inventory:
             res['inventory'] = self.reverse('api:inventory_detail', kwargs={'pk': obj.inventory.pk})
         if obj.last_job:
@@ -1826,6 +1683,10 @@ class HostSerializer(BaseSerializerWithVariables):
             group_list = [{'id': g.id, 'name': g.name} for g in obj.groups.all().order_by('id')[:5]]
         group_cnt = obj.groups.count()
         d.setdefault('groups', {'count': group_cnt, 'results': group_list})
+        if obj.inventory.kind == 'constructed':
+            summaries_qs = obj.constructed_host_summaries
+        else:
+            summaries_qs = obj.job_host_summaries
         d.setdefault(
             'recent_jobs',
             [
@@ -1836,7 +1697,7 @@ class HostSerializer(BaseSerializerWithVariables):
                     'status': j.job.status,
                     'finished': j.job.finished,
                 }
-                for j in obj.job_host_summaries.select_related('job__job_template').order_by('-created').defer('job__extra_vars', 'job__artifacts')[:5]
+                for j in summaries_qs.select_related('job__job_template').order_by('-created').defer('job__extra_vars', 'job__artifacts')[:5]
             ],
         )
         return d
@@ -1861,8 +1722,8 @@ class HostSerializer(BaseSerializerWithVariables):
         return value
 
     def validate_inventory(self, value):
-        if value.kind == 'smart':
-            raise serializers.ValidationError({"detail": _("Cannot create Host for Smart Inventory")})
+        if value.kind in ('constructed', 'smart'):
+            raise serializers.ValidationError({"detail": _("Cannot create Host for Smart or Constructed Inventories")})
         return value
 
     def validate_variables(self, value):
@@ -1879,7 +1740,7 @@ class HostSerializer(BaseSerializerWithVariables):
             vars_dict = parse_yaml_or_json(variables)
             vars_dict['ansible_ssh_port'] = port
             attrs['variables'] = json.dumps(vars_dict)
-        if Group.objects.filter(name=name, inventory=inventory).exists():
+        if inventory and Group.objects.filter(name=name, inventory=inventory).exists():
             raise serializers.ValidationError(_('A Group with that name already exists.'))
 
         return super(HostSerializer, self).validate(attrs)
@@ -1960,8 +1821,8 @@ class GroupSerializer(BaseSerializerWithVariables):
         return value
 
     def validate_inventory(self, value):
-        if value.kind == 'smart':
-            raise serializers.ValidationError({"detail": _("Cannot create Group for Smart Inventory")})
+        if value.kind in ('constructed', 'smart'):
+            raise serializers.ValidationError({"detail": _("Cannot create Group for Smart or Constructed Inventories")})
         return value
 
     def to_representation(self, obj):
@@ -1971,8 +1832,224 @@ class GroupSerializer(BaseSerializerWithVariables):
         return ret
 
 
-class GroupTreeSerializer(GroupSerializer):
+class BulkHostSerializer(HostSerializer):
+    class Meta:
+        model = Host
+        fields = (
+            'name',
+            'enabled',
+            'instance_id',
+            'description',
+            'variables',
+        )
 
+
+class BulkHostCreateSerializer(serializers.Serializer):
+    inventory = serializers.PrimaryKeyRelatedField(
+        queryset=Inventory.objects.all(), required=True, write_only=True, help_text=_('Primary Key ID of inventory to add hosts to.')
+    )
+    hosts = serializers.ListField(
+        child=BulkHostSerializer(),
+        allow_empty=False,
+        max_length=100000,
+        write_only=True,
+        help_text=_('List of hosts to be created, JSON. e.g. [{"name": "example.com"}, {"name": "127.0.0.1"}]'),
+    )
+
+    class Meta:
+        model = Inventory
+        fields = ('inventory', 'hosts')
+        read_only_fields = ()
+
+    def raise_if_host_counts_violated(self, attrs):
+        validation_info = get_licenser().validate()
+
+        org = attrs['inventory'].organization
+
+        if org:
+            org_active_count = Host.objects.org_active_count(org.id)
+            new_hosts = [h['name'] for h in attrs['hosts']]
+            org_net_new_host_count = len(new_hosts) - Host.objects.filter(inventory__organization=1, name__in=new_hosts).values('name').distinct().count()
+            if org.max_hosts > 0 and org_active_count + org_net_new_host_count > org.max_hosts:
+                raise PermissionDenied(
+                    _(
+                        "You have already reached the maximum number of %s hosts"
+                        " allowed for your organization. Contact your System Administrator"
+                        " for assistance." % org.max_hosts
+                    )
+                )
+
+            # Don't check license if it is open license
+        if validation_info.get('license_type', 'UNLICENSED') == 'open':
+            return
+
+        sys_free_instances = validation_info.get('free_instances', 0)
+        system_net_new_host_count = Host.objects.exclude(name__in=new_hosts).count()
+
+        if system_net_new_host_count > sys_free_instances:
+            hard_error = validation_info.get('trial', False) is True or validation_info['instance_count'] == 10
+            if hard_error:
+                # Only raise permission error for trial, otherwise just log a warning as we do in other inventory import situations
+                raise PermissionDenied(_("Host count exceeds available instances."))
+            logger.warning(_("Number of hosts allowed by license has been exceeded."))
+
+    def validate(self, attrs):
+        request = self.context.get('request', None)
+        inv = attrs['inventory']
+        if inv.kind != '':
+            raise serializers.ValidationError(_('Hosts can only be created in manual inventories (not smart or constructed types).'))
+        if len(attrs['hosts']) > settings.BULK_HOST_MAX_CREATE:
+            raise serializers.ValidationError(_('Number of hosts exceeds system setting BULK_HOST_MAX_CREATE'))
+        if request and not request.user.is_superuser:
+            if request.user not in inv.admin_role:
+                raise serializers.ValidationError(_(f'Inventory with id {inv.id} not found or lack permissions to add hosts.'))
+        current_hostnames = set(inv.hosts.values_list('name', flat=True))
+        new_names = [host['name'] for host in attrs['hosts']]
+        duplicate_new_names = [n for n in new_names if n in current_hostnames or new_names.count(n) > 1]
+        if duplicate_new_names:
+            raise serializers.ValidationError(_(f'Hostnames must be unique in an inventory. Duplicates found: {duplicate_new_names}'))
+
+        self.raise_if_host_counts_violated(attrs)
+
+        _now = now()
+        for host in attrs['hosts']:
+            host['created'] = _now
+            host['modified'] = _now
+            host['inventory'] = inv
+        return attrs
+
+    def create(self, validated_data):
+        # This assumes total_hosts is up to date, and it can get out of date if the inventory computed fields have not been updated lately.
+        # If we wanted to side step this we could query Hosts.objects.filter(inventory...)
+        old_total_hosts = validated_data['inventory'].total_hosts
+        result = [Host(**attrs) for attrs in validated_data['hosts']]
+        try:
+            Host.objects.bulk_create(result)
+        except Exception as e:
+            raise serializers.ValidationError({"detail": _(f"cannot create host, host creation error {e}")})
+        new_total_hosts = old_total_hosts + len(result)
+        request = self.context.get('request', None)
+        changes = {'total_hosts': [old_total_hosts, new_total_hosts]}
+        activity_entry = ActivityStream.objects.create(
+            operation='update',
+            object1='inventory',
+            changes=json.dumps(changes),
+            actor=request.user,
+        )
+        activity_entry.inventory.add(validated_data['inventory'])
+
+        # This actually updates the cached "total_hosts" field on the inventory
+        update_inventory_computed_fields.delay(validated_data['inventory'].id)
+        return_keys = [k for k in BulkHostSerializer().fields.keys()] + ['id']
+        return_data = {}
+        host_data = []
+        for r in result:
+            item = {k: getattr(r, k) for k in return_keys}
+            if settings.DATABASES and ('sqlite3' not in settings.DATABASES.get('default', {}).get('ENGINE')):
+                # sqlite acts different with bulk_create -- it doesn't return the id of the objects
+                # to get it, you have to do an additional query, which is not useful for our tests
+                item['url'] = reverse('api:host_detail', kwargs={'pk': r.id})
+            item['inventory'] = reverse('api:inventory_detail', kwargs={'pk': validated_data['inventory'].id})
+            host_data.append(item)
+        return_data['url'] = reverse('api:inventory_detail', kwargs={'pk': validated_data['inventory'].id})
+        return_data['hosts'] = host_data
+        return return_data
+
+
+class BulkHostDeleteSerializer(serializers.Serializer):
+    hosts = serializers.ListField(
+        allow_empty=False,
+        max_length=100000,
+        write_only=True,
+        help_text=_('List of hosts ids to be deleted, e.g. [105, 130, 131, 200]'),
+    )
+
+    class Meta:
+        model = Host
+        fields = ('hosts',)
+
+    def validate(self, attrs):
+        request = self.context.get('request', None)
+        max_hosts = settings.BULK_HOST_MAX_DELETE
+        # Validating the number of hosts to be deleted
+        if len(attrs['hosts']) > max_hosts:
+            raise serializers.ValidationError(
+                {
+                    "ERROR": 'Number of hosts exceeds system setting BULK_HOST_MAX_DELETE',
+                    "BULK_HOST_MAX_DELETE": max_hosts,
+                    "Hosts_count": len(attrs['hosts']),
+                }
+            )
+
+        # Getting list of all host objects, filtered by the list of the hosts to delete
+        attrs['host_qs'] = Host.objects.get_queryset().filter(pk__in=attrs['hosts']).only('id', 'inventory_id', 'name')
+
+        # Converting the queryset data in a dict. to reduce the number of queries when
+        # manipulating the data
+        attrs['hosts_data'] = attrs['host_qs'].values()
+
+        if len(attrs['host_qs']) == 0:
+            error_hosts = {host: "Hosts do not exist or you lack permission to delete it" for host in attrs['hosts']}
+            raise serializers.ValidationError({'hosts': error_hosts})
+
+        if len(attrs['host_qs']) < len(attrs['hosts']):
+            hosts_exists = [host['id'] for host in attrs['hosts_data']]
+            failed_hosts = list(set(attrs['hosts']).difference(hosts_exists))
+            error_hosts = {host: "Hosts do not exist or you lack permission to delete it" for host in failed_hosts}
+            raise serializers.ValidationError({'hosts': error_hosts})
+
+        # Getting all inventories that the hosts can be in
+        inv_list = list(set([host['inventory_id'] for host in attrs['hosts_data']]))
+
+        # Checking that the user have permission to all inventories
+        errors = dict()
+        for inv in Inventory.objects.get_queryset().filter(pk__in=inv_list):
+            if request and not request.user.is_superuser:
+                if request.user not in inv.admin_role:
+                    errors[inv.name] = "Lack permissions to delete hosts from this inventory."
+        if errors != {}:
+            raise PermissionDenied({"inventories": errors})
+
+        # check the inventory type only if the user have permission to it.
+        errors = dict()
+        for inv in Inventory.objects.get_queryset().filter(pk__in=inv_list):
+            if inv.kind != '':
+                errors[inv.name] = "Hosts can only be deleted from manual inventories."
+        if errors != {}:
+            raise serializers.ValidationError({"inventories": errors})
+        attrs['inventories'] = inv_list
+        return attrs
+
+    def delete(self, validated_data):
+        result = {"hosts": dict()}
+        changes = {'deleted_hosts': dict()}
+        for inventory in validated_data['inventories']:
+            changes['deleted_hosts'][inventory] = list()
+
+        for host in validated_data['hosts_data']:
+            result["hosts"][host["id"]] = f"The host {host['name']} was deleted"
+            changes['deleted_hosts'][host["inventory_id"]].append({"host_id": host["id"], "host_name": host["name"]})
+
+        try:
+            validated_data['host_qs'].delete()
+        except Exception as e:
+            raise serializers.ValidationError({"detail": _(f"cannot delete hosts, host deletion error {e}")})
+
+        request = self.context.get('request', None)
+
+        for inventory in validated_data['inventories']:
+            activity_entry = ActivityStream.objects.create(
+                operation='update',
+                object1='inventory',
+                changes=json.dumps(changes['deleted_hosts'][inventory]),
+                actor=request.user,
+            )
+            activity_entry.inventory.add(inventory)
+
+        return result
+
+
+class GroupTreeSerializer(GroupSerializer):
     children = serializers.SerializerMethodField()
 
     class Meta:
@@ -2020,6 +2097,7 @@ class GroupVariableDataSerializer(BaseVariableDataSerializer):
 
 class InventorySourceOptionsSerializer(BaseSerializer):
     credential = DeprecatedCredentialField(help_text=_('Cloud credential to use for inventory updates.'))
+    source = serializers.ChoiceField(choices=[])
 
     class Meta:
         fields = (
@@ -2027,6 +2105,7 @@ class InventorySourceOptionsSerializer(BaseSerializer):
             'source',
             'source_path',
             'source_vars',
+            'scm_branch',
             'credential',
             'enabled_var',
             'enabled_value',
@@ -2036,8 +2115,17 @@ class InventorySourceOptionsSerializer(BaseSerializer):
             'custom_virtualenv',
             'timeout',
             'verbosity',
+            'limit',
         )
         read_only_fields = ('*', 'custom_virtualenv')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if 'source' in self.fields:
+            source_options = load_combined_inventory_source_options()
+
+            self.fields['source'].choices = [(plugin, description) for plugin, description in source_options.items()]
 
     def get_related(self, obj):
         res = super(InventorySourceOptionsSerializer, self).get_related(obj)
@@ -2070,7 +2158,6 @@ class InventorySourceOptionsSerializer(BaseSerializer):
 
 
 class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOptionsSerializer):
-
     status = serializers.ChoiceField(choices=InventorySource.INVENTORY_SOURCE_STATUS_CHOICES, read_only=True)
     last_update_failed = serializers.BooleanField(read_only=True)
     last_updated = serializers.DateTimeField(read_only=True)
@@ -2143,8 +2230,8 @@ class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOpt
         return value
 
     def validate_inventory(self, value):
-        if value and value.kind == 'smart':
-            raise serializers.ValidationError({"detail": _("Cannot create Inventory Source for Smart Inventory")})
+        if value and value.kind in ('constructed', 'smart'):
+            raise serializers.ValidationError({"detail": _("Cannot create Inventory Source for Smart or Constructed Inventories")})
         return value
 
     # TODO: remove when old 'credential' fields are removed
@@ -2188,13 +2275,24 @@ class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOpt
         def get_field_from_model_or_attrs(fd):
             return attrs.get(fd, self.instance and getattr(self.instance, fd) or None)
 
-        if get_field_from_model_or_attrs('source') == 'scm':
+        if self.instance and self.instance.source == 'constructed':
+            allowed_fields = CONSTRUCTED_INVENTORY_SOURCE_EDITABLE_FIELDS
+            for field in attrs:
+                if attrs[field] != getattr(self.instance, field) and field not in allowed_fields:
+                    raise serializers.ValidationError({"error": _("Cannot change field '{}' on a constructed inventory source.").format(field)})
+        elif get_field_from_model_or_attrs('source') == 'scm':
             if ('source' in attrs or 'source_project' in attrs) and get_field_from_model_or_attrs('source_project') is None:
                 raise serializers.ValidationError({"source_project": _("Project required for scm type sources.")})
+        elif get_field_from_model_or_attrs('source') == 'constructed':
+            raise serializers.ValidationError({"error": _('constructed not a valid source for inventory')})
         else:
-            redundant_scm_fields = list(filter(lambda x: attrs.get(x, None), ['source_project', 'source_path']))
+            redundant_scm_fields = list(filter(lambda x: attrs.get(x, None), ['source_project', 'source_path', 'scm_branch']))
             if redundant_scm_fields:
                 raise serializers.ValidationError({"detail": _("Cannot set %s if not SCM type." % ' '.join(redundant_scm_fields))})
+
+        project = get_field_from_model_or_attrs('source_project')
+        if get_field_from_model_or_attrs('scm_branch') and not project.allow_override:
+            raise serializers.ValidationError({'scm_branch': _('Project does not allow overriding branch.')})
 
         attrs = super(InventorySourceSerializer, self).validate(attrs)
 
@@ -2215,7 +2313,6 @@ class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOpt
 
 
 class InventorySourceUpdateSerializer(InventorySourceSerializer):
-
     can_update = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -2232,7 +2329,6 @@ class InventorySourceUpdateSerializer(InventorySourceSerializer):
 
 
 class InventoryUpdateSerializer(UnifiedJobSerializer, InventorySourceOptionsSerializer):
-
     custom_virtualenv = serializers.ReadOnlyField()
 
     class Meta:
@@ -2273,7 +2369,6 @@ class InventoryUpdateSerializer(UnifiedJobSerializer, InventorySourceOptionsSeri
 
 
 class InventoryUpdateDetailSerializer(InventoryUpdateSerializer):
-
     source_project = serializers.SerializerMethodField(help_text=_('The project used for this job.'), method_name='get_source_project_id')
 
     class Meta:
@@ -2324,7 +2419,6 @@ class InventoryUpdateListSerializer(InventoryUpdateSerializer, UnifiedJobListSer
 
 
 class InventoryUpdateCancelSerializer(InventoryUpdateSerializer):
-
     can_cancel = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -2427,6 +2521,30 @@ class ResourceAccessListElementSerializer(UserSerializer):
         if 'summary_fields' not in ret:
             ret['summary_fields'] = {}
 
+        team_content_type = ContentType.objects.get_for_model(Team)
+        content_type = ContentType.objects.get_for_model(obj)
+
+        reversed_org_map = {}
+        for k, v in org_role_to_permission.items():
+            reversed_org_map[v] = k
+        reversed_role_map = {}
+        for k, v in to_permissions.items():
+            reversed_role_map[v] = k
+
+        def get_roles_from_perms(perm_list):
+            """given a list of permission codenames return a list of role names"""
+            role_names = set()
+            for codename in perm_list:
+                action = codename.split('_', 1)[0]
+                if action in reversed_role_map:
+                    role_names.add(reversed_role_map[action])
+                elif codename in reversed_org_map:
+                    if isinstance(obj, Organization):
+                        role_names.add(reversed_org_map[codename])
+                        if 'view_organization' not in role_names:
+                            role_names.add('read_role')
+            return list(role_names)
+
         def format_role_perm(role):
             role_dict = {'id': role.id, 'name': role.name, 'description': role.description}
             try:
@@ -2442,13 +2560,21 @@ class ResourceAccessListElementSerializer(UserSerializer):
             else:
                 # Singleton roles should not be managed from this view, as per copy/edit rework spec
                 role_dict['user_capabilities'] = {'unattach': False}
-            return {'role': role_dict, 'descendant_roles': get_roles_on_resource(obj, role)}
+
+            model_name = content_type.model
+            if isinstance(obj, Organization):
+                descendant_perms = [codename for codename in get_role_codenames(role) if codename.endswith(model_name) or codename.startswith('add_')]
+            else:
+                descendant_perms = [codename for codename in get_role_codenames(role) if codename.endswith(model_name)]
+
+            return {'role': role_dict, 'descendant_roles': get_roles_from_perms(descendant_perms)}
 
         def format_team_role_perm(naive_team_role, permissive_role_ids):
             ret = []
+            team = naive_team_role.content_object
             team_role = naive_team_role
             if naive_team_role.role_field == 'admin_role':
-                team_role = naive_team_role.content_object.member_role
+                team_role = team.member_role
             for role in team_role.children.filter(id__in=permissive_role_ids).all():
                 role_dict = {
                     'id': role.id,
@@ -2468,13 +2594,87 @@ class ResourceAccessListElementSerializer(UserSerializer):
                 else:
                     # Singleton roles should not be managed from this view, as per copy/edit rework spec
                     role_dict['user_capabilities'] = {'unattach': False}
-                ret.append({'role': role_dict, 'descendant_roles': get_roles_on_resource(obj, team_role)})
+
+                descendant_perms = list(
+                    RoleEvaluation.objects.filter(role__in=team.has_roles.all(), object_id=obj.id, content_type_id=content_type.id)
+                    .values_list('codename', flat=True)
+                    .distinct()
+                )
+
+                ret.append({'role': role_dict, 'descendant_roles': get_roles_from_perms(descendant_perms)})
             return ret
 
-        team_content_type = ContentType.objects.get_for_model(Team)
-        content_type = ContentType.objects.get_for_model(obj)
+        gfk_kwargs = dict(content_type_id=content_type.id, object_id=obj.id)
+        direct_permissive_role_ids = Role.objects.filter(**gfk_kwargs).values_list('id', flat=True)
 
-        direct_permissive_role_ids = Role.objects.filter(content_type=content_type, object_id=obj.id).values_list('id', flat=True)
+        if settings.ANSIBLE_BASE_ROLE_SYSTEM_ACTIVATED:
+            ret['summary_fields']['direct_access'] = []
+            ret['summary_fields']['indirect_access'] = []
+
+            new_roles_seen = set()
+            all_team_roles = set()
+            all_permissive_role_ids = set()
+            for evaluation in RoleEvaluation.objects.filter(role__in=user.has_roles.all(), **gfk_kwargs).prefetch_related('role'):
+                new_role = evaluation.role
+                if new_role.id in new_roles_seen:
+                    continue
+                new_roles_seen.add(new_role.id)
+                old_role = get_role_from_object_role(new_role)
+                all_permissive_role_ids.add(old_role.id)
+
+                if int(new_role.object_id) == obj.id and new_role.content_type_id == content_type.id:
+                    ret['summary_fields']['direct_access'].append(format_role_perm(old_role))
+                elif new_role.content_type_id == team_content_type.id:
+                    all_team_roles.add(old_role)
+                else:
+                    ret['summary_fields']['indirect_access'].append(format_role_perm(old_role))
+
+            # Lazy role creation gives us a big problem, where some intermediate roles are not easy to find
+            # like when a team has indirect permission, so here we get all roles the users teams have
+            # these contribute to all potential permission-granting roles of the object
+            user_teams_qs = permission_registry.team_model.objects.filter(member_roles__in=ObjectRole.objects.filter(users=user))
+            team_obj_roles = ObjectRole.objects.filter(teams__in=user_teams_qs)
+            for evaluation in RoleEvaluation.objects.filter(role__in=team_obj_roles, **gfk_kwargs).prefetch_related('role'):
+                new_role = evaluation.role
+                if new_role.id in new_roles_seen:
+                    continue
+                new_roles_seen.add(new_role.id)
+                old_role = get_role_from_object_role(new_role)
+                all_permissive_role_ids.add(old_role.id)
+
+            # In DAB RBAC, superuser is strictly a user flag, and global roles are not in the RoleEvaluation table
+            if user.is_superuser:
+                ret['summary_fields'].setdefault('indirect_access', [])
+                all_role_names = [field.name for field in obj._meta.get_fields() if isinstance(field, ImplicitRoleField)]
+                ret['summary_fields']['indirect_access'].append(
+                    {
+                        "role": {
+                            "id": None,
+                            "name": _("System Administrator"),
+                            "description": _("Can manage all aspects of the system"),
+                            "user_capabilities": {"unattach": False},
+                        },
+                        "descendant_roles": all_role_names,
+                    }
+                )
+            elif user.is_system_auditor:
+                ret['summary_fields'].setdefault('indirect_access', [])
+                ret['summary_fields']['indirect_access'].append(
+                    {
+                        "role": {
+                            "id": None,
+                            "name": _("Controller System Auditor"),
+                            "description": _("Can view all aspects of the system"),
+                            "user_capabilities": {"unattach": False},
+                        },
+                        "descendant_roles": ["read_role"],
+                    }
+                )
+
+            ret['summary_fields']['direct_access'].extend([y for x in (format_team_role_perm(r, all_permissive_role_ids) for r in all_team_roles) for y in x])
+
+            return ret
+
         all_permissive_role_ids = Role.objects.filter(content_type=content_type, object_id=obj.id).values_list('ancestors__id', flat=True)
 
         direct_access_roles = user.roles.filter(id__in=direct_permissive_role_ids).all()
@@ -2668,7 +2868,7 @@ class CredentialSerializer(BaseSerializer):
             ):
                 if getattr(self.instance, related_objects).count() > 0:
                     raise ValidationError(
-                        _('You cannot change the credential type of the credential, as it may break the functionality' ' of the resources using it.')
+                        _('You cannot change the credential type of the credential, as it may break the functionality of the resources using it.')
                     )
 
         return credential_type
@@ -2682,14 +2882,13 @@ class CredentialSerializer(BaseSerializer):
 
 
 class CredentialSerializerCreate(CredentialSerializer):
-
     user = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(),
         required=False,
         default=None,
         write_only=True,
         allow_null=True,
-        help_text=_('Write-only field used to add user to owner role. If provided, ' 'do not give either team or organization. Only valid for creation.'),
+        help_text=_('Write-only field used to add user to owner role. If provided, do not give either team or organization. Only valid for creation.'),
     )
     team = serializers.PrimaryKeyRelatedField(
         queryset=Team.objects.all(),
@@ -2697,14 +2896,14 @@ class CredentialSerializerCreate(CredentialSerializer):
         default=None,
         write_only=True,
         allow_null=True,
-        help_text=_('Write-only field used to add team to owner role. If provided, ' 'do not give either user or organization. Only valid for creation.'),
+        help_text=_('Write-only field used to add team to owner role. If provided, do not give either user or organization. Only valid for creation.'),
     )
     organization = serializers.PrimaryKeyRelatedField(
         queryset=Organization.objects.all(),
         required=False,
         default=None,
         allow_null=True,
-        help_text=_('Inherit permissions from organization roles. If provided on creation, ' 'do not give either user or team.'),
+        help_text=_('Inherit permissions from organization roles. If provided on creation, do not give either user or team.'),
     )
 
     class Meta:
@@ -2726,7 +2925,7 @@ class CredentialSerializerCreate(CredentialSerializer):
         if len(owner_fields) > 1:
             received = ", ".join(sorted(owner_fields))
             raise serializers.ValidationError(
-                {"detail": _("Only one of 'user', 'team', or 'organization' should be provided, " "received {} fields.".format(received))}
+                {"detail": _("Only one of 'user', 'team', or 'organization' should be provided, received {} fields.".format(received))}
             )
 
         if attrs.get('team'):
@@ -2744,7 +2943,7 @@ class CredentialSerializerCreate(CredentialSerializer):
         credential = super(CredentialSerializerCreate, self).create(validated_data)
 
         if user:
-            credential.admin_role.members.add(user)
+            give_creator_permissions(user, credential)
         if team:
             if not credential.organization or team.organization.id != credential.organization.id:
                 raise serializers.ValidationError({"detail": _("Credential organization must be set and match before assigning to a team")})
@@ -2997,7 +3196,7 @@ class JobTemplateSerializer(JobTemplateMixin, UnifiedJobTemplateSerializer, JobO
         if get_field_from_model_or_attrs('host_config_key') and not inventory:
             raise serializers.ValidationError({'host_config_key': _("Cannot enable provisioning callback without an inventory set.")})
 
-        prompting_error_message = _("Must either set a default value or ask to prompt on launch.")
+        prompting_error_message = _("You must either set a default value or ask to prompt on launch.")
         if project is None:
             raise serializers.ValidationError({'project': _("Job Templates must have a project assigned.")})
         elif inventory is None and not get_field_from_model_or_attrs('ask_inventory_on_launch'):
@@ -3037,7 +3236,6 @@ class JobTemplateWithSpecSerializer(JobTemplateSerializer):
 
 
 class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
-
     passwords_needed_to_start = serializers.ReadOnlyField()
     artifacts = serializers.SerializerMethodField()
 
@@ -3120,7 +3318,6 @@ class JobSerializer(UnifiedJobSerializer, JobOptionsSerializer):
 
 
 class JobDetailSerializer(JobSerializer):
-
     playbook_counts = serializers.SerializerMethodField(help_text=_('A count of all plays and tasks for the job run.'))
     custom_virtualenv = serializers.ReadOnlyField()
 
@@ -3138,7 +3335,6 @@ class JobDetailSerializer(JobSerializer):
 
 
 class JobCancelSerializer(BaseSerializer):
-
     can_cancel = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -3147,7 +3343,6 @@ class JobCancelSerializer(BaseSerializer):
 
 
 class JobRelaunchSerializer(BaseSerializer):
-
     passwords_needed_to_start = serializers.SerializerMethodField()
     retry_counts = serializers.SerializerMethodField()
     hosts = serializers.ChoiceField(
@@ -3207,7 +3402,6 @@ class JobRelaunchSerializer(BaseSerializer):
 
 
 class JobCreateScheduleSerializer(LabelsListMixin, BaseSerializer):
-
     can_schedule = serializers.SerializerMethodField()
     prompts = serializers.SerializerMethodField()
 
@@ -3333,7 +3527,6 @@ class AdHocCommandDetailSerializer(AdHocCommandSerializer):
 
 
 class AdHocCommandCancelSerializer(AdHocCommandSerializer):
-
     can_cancel = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -3372,7 +3565,6 @@ class SystemJobTemplateSerializer(UnifiedJobTemplateSerializer):
 
 
 class SystemJobSerializer(UnifiedJobSerializer):
-
     result_stdout = serializers.SerializerMethodField()
 
     class Meta:
@@ -3393,13 +3585,12 @@ class SystemJobSerializer(UnifiedJobSerializer):
         try:
             return obj.result_stdout
         except StdoutMaxBytesExceeded as e:
-            return _("Standard Output too large to display ({text_size} bytes), " "only download supported for sizes over {supported_size} bytes.").format(
+            return _("Standard Output too large to display ({text_size} bytes), only download supported for sizes over {supported_size} bytes.").format(
                 text_size=e.total, supported_size=e.supported
             )
 
 
 class SystemJobCancelSerializer(SystemJobSerializer):
-
     can_cancel = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -3564,7 +3755,6 @@ class WorkflowJobListSerializer(WorkflowJobSerializer, UnifiedJobListSerializer)
 
 
 class WorkflowJobCancelSerializer(WorkflowJobSerializer):
-
     can_cancel = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -3578,7 +3768,6 @@ class WorkflowApprovalViewSerializer(UnifiedJobSerializer):
 
 
 class WorkflowApprovalSerializer(UnifiedJobSerializer):
-
     can_approve_or_deny = serializers.SerializerMethodField()
     approval_expiration = serializers.SerializerMethodField()
     timed_out = serializers.ReadOnlyField()
@@ -3943,6 +4132,7 @@ class JobHostSummarySerializer(BaseSerializer):
             '-description',
             'job',
             'host',
+            'constructed_host',
             'host_name',
             'changed',
             'dark',
@@ -3973,7 +4163,6 @@ class JobHostSummarySerializer(BaseSerializer):
 
 
 class JobEventSerializer(BaseSerializer):
-
     event_display = serializers.CharField(source='get_event_display2', read_only=True)
     event_level = serializers.IntegerField(read_only=True)
 
@@ -4027,7 +4216,7 @@ class JobEventSerializer(BaseSerializer):
         # Show full stdout for playbook_on_* events.
         if obj and obj.event.startswith('playbook_on'):
             return data
-        # If the view logic says to not trunctate (request was to the detail view or a param was used)
+        # If the view logic says to not truncate (request was to the detail view or a param was used)
         if self.context.get('no_truncate', False):
             return data
         max_bytes = settings.EVENT_STDOUT_MAX_BYTES_DISPLAY
@@ -4058,7 +4247,7 @@ class ProjectUpdateEventSerializer(JobEventSerializer):
         # raw SCM URLs in their stdout (which *could* contain passwords)
         # attempt to detect and filter HTTP basic auth passwords in the stdout
         # of these types of events
-        if obj.event_data.get('task_action') in ('git', 'svn'):
+        if obj.event_data.get('task_action') in ('git', 'svn', 'ansible.builtin.git', 'ansible.builtin.svn'):
             try:
                 return json.loads(UriCleaner.remove_sensitive(json.dumps(obj.event_data)))
             except Exception:
@@ -4069,7 +4258,6 @@ class ProjectUpdateEventSerializer(JobEventSerializer):
 
 
 class AdHocCommandEventSerializer(BaseSerializer):
-
     event_display = serializers.CharField(source='get_event_display', read_only=True)
 
     class Meta:
@@ -4103,7 +4291,7 @@ class AdHocCommandEventSerializer(BaseSerializer):
 
     def to_representation(self, obj):
         data = super(AdHocCommandEventSerializer, self).to_representation(obj)
-        # If the view logic says to not trunctate (request was to the detail view or a param was used)
+        # If the view logic says to not truncate (request was to the detail view or a param was used)
         if self.context.get('no_truncate', False):
             return data
         max_bytes = settings.EVENT_STDOUT_MAX_BYTES_DISPLAY
@@ -4311,7 +4499,7 @@ class JobLaunchSerializer(BaseSerializer):
                 if cred.unique_hash() in provided_mapping.keys():
                     continue  # User replaced credential with new of same type
                 errors.setdefault('credentials', []).append(
-                    _('Removing {} credential at launch time without replacement is not supported. ' 'Provided list lacked credential(s): {}.').format(
+                    _('Removing {} credential at launch time without replacement is not supported. Provided list lacked credential(s): {}.').format(
                         cred.unique_hash(display=True), ', '.join([str(c) for c in removed_creds])
                     )
                 )
@@ -4351,7 +4539,6 @@ class JobLaunchSerializer(BaseSerializer):
 
 
 class WorkflowJobLaunchSerializer(BaseSerializer):
-
     can_start_without_user_input = serializers.BooleanField(read_only=True)
     defaults = serializers.SerializerMethodField()
     variables_needed_to_start = serializers.ReadOnlyField()
@@ -4408,7 +4595,6 @@ class WorkflowJobLaunchSerializer(BaseSerializer):
         return False
 
     def get_defaults(self, obj):
-
         defaults_dict = {}
         for field_name in WorkflowJobTemplate.get_ask_mapping().keys():
             if field_name == 'inventory':
@@ -4425,7 +4611,6 @@ class WorkflowJobLaunchSerializer(BaseSerializer):
         return dict(name=obj.name, id=obj.id, description=obj.description)
 
     def validate(self, attrs):
-
         template = self.instance
 
         accepted, rejected, errors = template._accept_or_ignore_job_kwargs(**attrs)
@@ -4451,6 +4636,270 @@ class WorkflowJobLaunchSerializer(BaseSerializer):
         template.scm_branch = WFJT_scm_branch
 
         return accepted
+
+
+class BulkJobNodeSerializer(WorkflowJobNodeSerializer):
+    # We don't do a PrimaryKeyRelatedField for unified_job_template and others, because that increases the number
+    # of database queries, rather we take them as integer and later convert them to objects in get_objectified_jobs
+    unified_job_template = serializers.IntegerField(
+        required=True, min_value=1, help_text=_('Primary key of the template for this job, can be a job template or inventory source.')
+    )
+    inventory = serializers.IntegerField(required=False, min_value=1)
+    execution_environment = serializers.IntegerField(required=False, min_value=1)
+    # many-to-many fields
+    credentials = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False)
+    labels = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False)
+    instance_groups = serializers.ListField(child=serializers.IntegerField(min_value=1), required=False)
+
+    class Meta:
+        model = WorkflowJobNode
+        fields = ('*', 'credentials', 'labels', 'instance_groups')  # m2m fields are not canonical for WJ nodes
+
+    def validate(self, attrs):
+        return super(LaunchConfigurationBaseSerializer, self).validate(attrs)
+
+    def get_validation_exclusions(self, obj=None):
+        ret = super().get_validation_exclusions(obj)
+        ret.extend(['unified_job_template', 'inventory', 'execution_environment'])
+        return ret
+
+
+class BulkJobLaunchSerializer(serializers.Serializer):
+    name = serializers.CharField(default='Bulk Job Launch', max_length=512, write_only=True, required=False, allow_blank=True)  # limited by max name of jobs
+    jobs = BulkJobNodeSerializer(
+        many=True,
+        allow_empty=False,
+        write_only=True,
+        max_length=100000,
+        help_text=_('List of jobs to be launched, JSON. e.g. [{"unified_job_template": 7}, {"unified_job_template": 10}]'),
+    )
+    description = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    extra_vars = serializers.JSONField(write_only=True, required=False)
+    organization = serializers.PrimaryKeyRelatedField(
+        queryset=Organization.objects.all(),
+        required=False,
+        default=None,
+        allow_null=True,
+        write_only=True,
+        help_text=_('Inherit permissions from this organization. If not provided, a organization the user is a member of will be selected automatically.'),
+    )
+    inventory = serializers.PrimaryKeyRelatedField(queryset=Inventory.objects.all(), required=False, write_only=True)
+    limit = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    scm_branch = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    skip_tags = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    job_tags = serializers.CharField(write_only=True, required=False, allow_blank=False)
+
+    class Meta:
+        model = WorkflowJob
+        fields = ('name', 'jobs', 'description', 'extra_vars', 'organization', 'inventory', 'limit', 'scm_branch', 'skip_tags', 'job_tags')
+        read_only_fields = ()
+
+    def validate(self, attrs):
+        request = self.context.get('request', None)
+        identifiers = set()
+        if len(attrs['jobs']) > settings.BULK_JOB_MAX_LAUNCH:
+            raise serializers.ValidationError(_('Number of requested jobs exceeds system setting BULK_JOB_MAX_LAUNCH'))
+
+        for node in attrs['jobs']:
+            if 'identifier' in node:
+                if node['identifier'] in identifiers:
+                    raise serializers.ValidationError(_(f"Identifier {node['identifier']} not unique"))
+                identifiers.add(node['identifier'])
+            else:
+                node['identifier'] = str(uuid4())
+
+        requested_ujts = {j['unified_job_template'] for j in attrs['jobs']}
+        requested_use_inventories = {job['inventory'] for job in attrs['jobs'] if 'inventory' in job}
+        requested_use_execution_environments = {job['execution_environment'] for job in attrs['jobs'] if 'execution_environment' in job}
+        requested_use_credentials = set()
+        requested_use_labels = set()
+        requested_use_instance_groups = set()
+        for job in attrs['jobs']:
+            for cred in job.get('credentials', []):
+                requested_use_credentials.add(cred)
+            for label in job.get('labels', []):
+                requested_use_labels.add(label)
+            for instance_group in job.get('instance_groups', []):
+                requested_use_instance_groups.add(instance_group)
+
+        key_to_obj_map = {
+            "unified_job_template": {obj.id: obj for obj in UnifiedJobTemplate.objects.filter(id__in=requested_ujts)},
+            "inventory": {obj.id: obj for obj in Inventory.objects.filter(id__in=requested_use_inventories)},
+            "credentials": {obj.id: obj for obj in Credential.objects.filter(id__in=requested_use_credentials)},
+            "labels": {obj.id: obj for obj in Label.objects.filter(id__in=requested_use_labels)},
+            "instance_groups": {obj.id: obj for obj in InstanceGroup.objects.filter(id__in=requested_use_instance_groups)},
+            "execution_environment": {obj.id: obj for obj in ExecutionEnvironment.objects.filter(id__in=requested_use_execution_environments)},
+        }
+
+        ujts = {}
+        for ujt in key_to_obj_map['unified_job_template'].values():
+            ujts.setdefault(type(ujt), [])
+            ujts[type(ujt)].append(ujt)
+
+        unallowed_types = set(ujts.keys()) - set([JobTemplate, Project, InventorySource, WorkflowJobTemplate])
+        if unallowed_types:
+            type_names = ' '.join([cls._meta.verbose_name.title() for cls in unallowed_types])
+            raise serializers.ValidationError(_("Template types {type_names} not allowed in bulk jobs").format(type_names=type_names))
+
+        for model, obj_list in ujts.items():
+            role_field = 'execute_role' if issubclass(model, (JobTemplate, WorkflowJobTemplate)) else 'update_role'
+            self.check_list_permission(model, set([obj.id for obj in obj_list]), role_field)
+
+        self.check_organization_permission(attrs, request)
+
+        if 'inventory' in attrs:
+            requested_use_inventories.add(attrs['inventory'].id)
+
+        self.check_list_permission(Inventory, requested_use_inventories, 'use_role')
+
+        self.check_list_permission(Credential, requested_use_credentials, 'use_role')
+        self.check_list_permission(Label, requested_use_labels)
+        self.check_list_permission(InstanceGroup, requested_use_instance_groups)  # TODO: change to use_role for conflict
+        self.check_list_permission(ExecutionEnvironment, requested_use_execution_environments)  # TODO: change if roles introduced
+
+        jobs_object = self.get_objectified_jobs(attrs, key_to_obj_map)
+
+        attrs['jobs'] = jobs_object
+        if 'extra_vars' in attrs:
+            extra_vars_dict = parse_yaml_or_json(attrs['extra_vars'])
+            attrs['extra_vars'] = json.dumps(extra_vars_dict)
+        attrs = super().validate(attrs)
+        return attrs
+
+    def check_list_permission(self, model, id_list, role_field=None):
+        if not id_list:
+            return
+        user = self.context['request'].user
+        if role_field is None:  # implies "read" level permission is required
+            access_qs = user.get_queryset(model)
+        else:
+            access_qs = model.accessible_objects(user, role_field)
+
+        not_allowed = set(id_list) - set(access_qs.filter(id__in=id_list).values_list('id', flat=True))
+        if not_allowed:
+            raise serializers.ValidationError(
+                _("{model_name} {not_allowed} not found or you don't have permissions to access it").format(
+                    model_name=model._meta.verbose_name_plural.title(), not_allowed=not_allowed
+                )
+            )
+
+    def create(self, validated_data):
+        request = self.context.get('request', None)
+        launch_user = request.user if request else None
+        job_node_data = validated_data.pop('jobs')
+        wfj_deferred_attr_names = ('skip_tags', 'limit', 'job_tags')
+        wfj_deferred_vals = {}
+        for item in wfj_deferred_attr_names:
+            wfj_deferred_vals[item] = validated_data.pop(item, None)
+
+        wfj = WorkflowJob.objects.create(**validated_data, is_bulk_job=True, launch_type='manual', created_by=launch_user)
+        for key, val in wfj_deferred_vals.items():
+            if val:
+                setattr(wfj, key, val)
+        nodes = []
+        node_m2m_objects = {}
+        node_m2m_object_types_to_through_model = {
+            'credentials': WorkflowJobNode.credentials.through,
+            'labels': WorkflowJobNode.labels.through,
+            'instance_groups': WorkflowJobNode.instance_groups.through,
+        }
+        node_deferred_attr_names = (
+            'limit',
+            'scm_branch',
+            'verbosity',
+            'forks',
+            'diff_mode',
+            'job_tags',
+            'job_type',
+            'skip_tags',
+            'job_slice_count',
+            'timeout',
+        )
+        node_deferred_attrs = {}
+        for node_attrs in job_node_data:
+            # we need to add any m2m objects after creation via the through model
+            node_m2m_objects[node_attrs['identifier']] = {}
+            node_deferred_attrs[node_attrs['identifier']] = {}
+            for item in node_m2m_object_types_to_through_model.keys():
+                if item in node_attrs:
+                    node_m2m_objects[node_attrs['identifier']][item] = node_attrs.pop(item)
+
+            # Some attributes are not accepted by WorkflowJobNode __init__, we have to set them after
+            for item in node_deferred_attr_names:
+                if item in node_attrs:
+                    node_deferred_attrs[node_attrs['identifier']][item] = node_attrs.pop(item)
+
+            # Create the node objects
+            node_obj = WorkflowJobNode(workflow_job=wfj, created=wfj.created, modified=wfj.modified, **node_attrs)
+
+            # we can set the deferred attrs now
+            for item, value in node_deferred_attrs[node_attrs['identifier']].items():
+                setattr(node_obj, item, value)
+
+            # the node is now ready to be bulk created
+            nodes.append(node_obj)
+
+            # we'll need this later when we do the m2m through model bulk create
+            node_m2m_objects[node_attrs['identifier']]['node'] = node_obj
+
+        WorkflowJobNode.objects.bulk_create(nodes)
+
+        # Deal with the m2m objects we have to create once the node exists
+        for field_name, through_model in node_m2m_object_types_to_through_model.items():
+            through_model_objects = []
+            for node_identifier in node_m2m_objects.keys():
+                if field_name in node_m2m_objects[node_identifier] and field_name == 'credentials':
+                    for cred in node_m2m_objects[node_identifier][field_name]:
+                        through_model_objects.append(through_model(credential=cred, workflowjobnode=node_m2m_objects[node_identifier]['node']))
+                if field_name in node_m2m_objects[node_identifier] and field_name == 'labels':
+                    for label in node_m2m_objects[node_identifier][field_name]:
+                        through_model_objects.append(through_model(label=label, workflowjobnode=node_m2m_objects[node_identifier]['node']))
+                if field_name in node_m2m_objects[node_identifier] and field_name == 'instance_groups':
+                    for instance_group in node_m2m_objects[node_identifier][field_name]:
+                        through_model_objects.append(through_model(instancegroup=instance_group, workflowjobnode=node_m2m_objects[node_identifier]['node']))
+            if through_model_objects:
+                through_model.objects.bulk_create(through_model_objects)
+
+        wfj.save()
+        wfj.signal_start()
+
+        return WorkflowJobSerializer().to_representation(wfj)
+
+    def check_organization_permission(self, attrs, request):
+        # validate Organization
+        # - If the orgs is not set, set it to the org of the launching user
+        # - If the user is part of multiple orgs, throw a validation error saying user is part of multiple orgs, please provide one
+        if not request.user.is_superuser:
+            read_org_qs = Organization.accessible_objects(request.user, 'member_role')
+            if 'organization' not in attrs or attrs['organization'] == None or attrs['organization'] == '':
+                read_org_ct = read_org_qs.count()
+                if read_org_ct == 1:
+                    attrs['organization'] = read_org_qs.first()
+                elif read_org_ct > 1:
+                    raise serializers.ValidationError("User has permission to multiple Organizations, please set one of them in the request")
+                else:
+                    raise serializers.ValidationError("User not part of any organization, please assign an organization to assign to the bulk job")
+            else:
+                allowed_orgs = set(read_org_qs.values_list('id', flat=True))
+                requested_org = attrs['organization']
+                if requested_org.id not in allowed_orgs:
+                    raise ValidationError(_(f"Organization {requested_org.id} not found or you don't have permissions to access it"))
+
+    def get_objectified_jobs(self, attrs, key_to_obj_map):
+        objectified_jobs = []
+        # This loop is generalized so we should only have to add related items to the key_to_obj_map
+        for job in attrs['jobs']:
+            objectified_job = {}
+            for key, value in job.items():
+                if key in key_to_obj_map:
+                    if isinstance(value, int):
+                        objectified_job[key] = key_to_obj_map[key][value]
+                    elif isinstance(value, list):
+                        objectified_job[key] = [key_to_obj_map[key][item] for item in value]
+                else:
+                    objectified_job[key] = value
+            objectified_jobs.append(objectified_job)
+        return objectified_jobs
 
 
 class NotificationTemplateSerializer(BaseSerializer):
@@ -4532,7 +4981,7 @@ class NotificationTemplateSerializer(BaseSerializer):
                     for subevent in event_messages:
                         if subevent not in ('running', 'approved', 'timed_out', 'denied'):
                             error_list.append(
-                                _("Workflow Approval event '{}' invalid, must be one of " "'running', 'approved', 'timed_out', or 'denied'").format(subevent)
+                                _("Workflow Approval event '{}' invalid, must be one of 'running', 'approved', 'timed_out', or 'denied'").format(subevent)
                             )
                             continue
                         subevent_messages = event_messages[subevent]
@@ -4588,16 +5037,21 @@ class NotificationTemplateSerializer(BaseSerializer):
                 body = messages[event].get('body', {})
                 if body:
                     try:
-                        rendered_body = (
-                            sandbox.ImmutableSandboxedEnvironment(undefined=DescriptiveUndefined).from_string(body).render(JobNotificationMixin.context_stub())
-                        )
-                        potential_body = json.loads(rendered_body)
-                        if not isinstance(potential_body, dict):
-                            error_list.append(
-                                _("Webhook body for '{}' should be a json dictionary. Found type '{}'.".format(event, type(potential_body).__name__))
-                            )
-                    except json.JSONDecodeError as exc:
-                        error_list.append(_("Webhook body for '{}' is not a valid json dictionary ({}).".format(event, exc)))
+                        sandbox.ImmutableSandboxedEnvironment(undefined=DescriptiveUndefined).from_string(body).render(JobNotificationMixin.context_stub())
+
+                        # https://github.com/ansible/awx/issues/14410
+
+                        # When rendering something such as "{{ job.id }}"
+                        # the return type is not a dict, unlike "{{ job_metadata }}" which is a dict
+
+                        # potential_body = json.loads(rendered_body)
+
+                        # if not isinstance(potential_body, dict):
+                        #     error_list.append(
+                        #         _("Webhook body for '{}' should be a json dictionary. Found type '{}'.".format(event, type(potential_body).__name__))
+                        #     )
+                    except Exception as exc:
+                        error_list.append(_("Webhook body for '{}' is not valid. The following gave an error ({}).".format(event, exc)))
 
         if error_list:
             raise serializers.ValidationError(error_list)
@@ -4666,7 +5120,6 @@ class NotificationTemplateSerializer(BaseSerializer):
 
 
 class NotificationSerializer(BaseSerializer):
-
     body = serializers.SerializerMethodField(help_text=_('Notification body'))
 
     class Meta:
@@ -4686,7 +5139,7 @@ class NotificationSerializer(BaseSerializer):
         )
 
     def get_body(self, obj):
-        if obj.notification_type in ('webhook', 'pagerduty'):
+        if obj.notification_type in ('webhook', 'pagerduty', 'awssns'):
             if isinstance(obj.body, dict):
                 if 'body' in obj.body:
                     return obj.body['body']
@@ -4708,9 +5161,9 @@ class NotificationSerializer(BaseSerializer):
     def to_representation(self, obj):
         ret = super(NotificationSerializer, self).to_representation(obj)
 
-        if obj.notification_type == 'webhook':
+        if obj.notification_type in ('webhook', 'awssns'):
             ret.pop('subject')
-        if obj.notification_type not in ('email', 'webhook', 'pagerduty'):
+        if obj.notification_type not in ('email', 'webhook', 'pagerduty', 'awssns'):
             ret.pop('body')
         return ret
 
@@ -4800,7 +5253,7 @@ class ScheduleSerializer(LaunchConfigurationBaseSerializer, SchedulePreviewSeria
         ),
     )
     until = serializers.SerializerMethodField(
-        help_text=_('The date this schedule will end. This field is computed from the RRULE. If the schedule does not end an emptry string will be returned'),
+        help_text=_('The date this schedule will end. This field is computed from the RRULE. If the schedule does not end an empty string will be returned'),
     )
 
     class Meta:
@@ -4853,7 +5306,7 @@ class ScheduleSerializer(LaunchConfigurationBaseSerializer, SchedulePreviewSeria
         return summary_fields
 
     def validate_unified_job_template(self, value):
-        if type(value) == InventorySource and value.source not in CLOUD_INVENTORY_SOURCES:
+        if type(value) == InventorySource and value.source not in load_combined_inventory_source_options():
             raise serializers.ValidationError(_('Inventory Source must be a cloud resource.'))
         elif type(value) == Project and value.scm_type == '':
             raise serializers.ValidationError(_('Manual Project cannot have a schedule set.'))
@@ -4871,16 +5324,53 @@ class ScheduleSerializer(LaunchConfigurationBaseSerializer, SchedulePreviewSeria
 class InstanceLinkSerializer(BaseSerializer):
     class Meta:
         model = InstanceLink
-        fields = ('source', 'target', 'link_state')
+        fields = ('id', 'related', 'source', 'target', 'target_full_address', 'link_state')
 
-    source = serializers.SlugRelatedField(slug_field="hostname", read_only=True)
-    target = serializers.SlugRelatedField(slug_field="hostname", read_only=True)
+    source = serializers.SlugRelatedField(slug_field="hostname", queryset=Instance.objects.all())
+
+    target = serializers.SerializerMethodField()
+    target_full_address = serializers.SerializerMethodField()
+
+    def get_related(self, obj):
+        res = super(InstanceLinkSerializer, self).get_related(obj)
+        res['source_instance'] = self.reverse('api:instance_detail', kwargs={'pk': obj.source.id})
+        res['target_address'] = self.reverse('api:receptor_address_detail', kwargs={'pk': obj.target.id})
+        return res
+
+    def get_target(self, obj):
+        return obj.target.instance.hostname
+
+    def get_target_full_address(self, obj):
+        return obj.target.get_full_address()
 
 
 class InstanceNodeSerializer(BaseSerializer):
     class Meta:
         model = Instance
         fields = ('id', 'hostname', 'node_type', 'node_state', 'enabled')
+
+
+class ReceptorAddressSerializer(BaseSerializer):
+    full_address = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReceptorAddress
+        fields = (
+            'id',
+            'url',
+            'address',
+            'port',
+            'protocol',
+            'websocket_path',
+            'is_internal',
+            'canonical',
+            'instance',
+            'peers_from_control_nodes',
+            'full_address',
+        )
+
+    def get_full_address(self, obj):
+        return obj.get_full_address()
 
 
 class InstanceSerializer(BaseSerializer):
@@ -4891,10 +5381,17 @@ class InstanceSerializer(BaseSerializer):
     jobs_running = serializers.IntegerField(help_text=_('Count of jobs in the running or waiting state that are targeted for this instance'), read_only=True)
     jobs_total = serializers.IntegerField(help_text=_('Count of all jobs that target this instance'), read_only=True)
     health_check_pending = serializers.SerializerMethodField()
+    peers = serializers.PrimaryKeyRelatedField(
+        help_text=_('Primary keys of receptor addresses to peer to.'), many=True, required=False, queryset=ReceptorAddress.objects.all()
+    )
+    reverse_peers = serializers.SerializerMethodField()
+    listener_port = serializers.IntegerField(source='canonical_address_port', required=False, allow_null=True)
+    peers_from_control_nodes = serializers.BooleanField(source='canonical_address_peers_from_control_nodes', required=False)
+    protocol = serializers.SerializerMethodField()
 
     class Meta:
         model = Instance
-        read_only_fields = ('ip_address', 'uuid', 'version')
+        read_only_fields = ('ip_address', 'uuid', 'version', 'managed', 'reverse_peers')
         fields = (
             'id',
             'hostname',
@@ -4925,8 +5422,13 @@ class InstanceSerializer(BaseSerializer):
             'managed_by_policy',
             'node_type',
             'node_state',
+            'managed',
             'ip_address',
+            'peers',
+            'reverse_peers',
             'listener_port',
+            'peers_from_control_nodes',
+            'protocol',
         )
         extra_kwargs = {
             'node_type': {'initial': Instance.Types.EXECUTION, 'default': Instance.Types.EXECUTION},
@@ -4948,15 +5450,53 @@ class InstanceSerializer(BaseSerializer):
 
     def get_related(self, obj):
         res = super(InstanceSerializer, self).get_related(obj)
+        res['receptor_addresses'] = self.reverse('api:instance_receptor_addresses_list', kwargs={'pk': obj.pk})
         res['jobs'] = self.reverse('api:instance_unified_jobs_list', kwargs={'pk': obj.pk})
-        res['instance_groups'] = self.reverse('api:instance_instance_groups_list', kwargs={'pk': obj.pk})
-        if settings.IS_K8S and obj.node_type in (Instance.Types.EXECUTION,):
-            res['install_bundle'] = self.reverse('api:instance_install_bundle', kwargs={'pk': obj.pk})
         res['peers'] = self.reverse('api:instance_peers_list', kwargs={"pk": obj.pk})
+        res['instance_groups'] = self.reverse('api:instance_instance_groups_list', kwargs={'pk': obj.pk})
+        if obj.node_type in [Instance.Types.EXECUTION, Instance.Types.HOP] and not obj.managed:
+            res['install_bundle'] = self.reverse('api:instance_install_bundle', kwargs={'pk': obj.pk})
         if self.context['request'].user.is_superuser or self.context['request'].user.is_system_auditor:
             if obj.node_type == 'execution':
                 res['health_check'] = self.reverse('api:instance_health_check', kwargs={'pk': obj.pk})
         return res
+
+    def create_or_update(self, validated_data, obj=None, create=True):
+        # create a managed receptor address if listener port is defined
+        port = validated_data.pop('listener_port', -1)
+        peers_from_control_nodes = validated_data.pop('peers_from_control_nodes', -1)
+
+        # delete the receptor address if the port is explicitly set to None
+        if obj and port == None:
+            obj.receptor_addresses.filter(address=obj.hostname).delete()
+
+        if create:
+            instance = super(InstanceSerializer, self).create(validated_data)
+        else:
+            instance = super(InstanceSerializer, self).update(obj, validated_data)
+            instance.refresh_from_db()  # instance canonical address lookup is deferred, so needs to be reloaded
+
+        # only create or update if port is defined in validated_data or already exists in the
+        # canonical address
+        # this prevents creating a receptor address if peers_from_control_nodes is in
+        # validated_data but a port is not set
+        if (port != None and port != -1) or instance.canonical_address_port:
+            kwargs = {}
+            if port != -1:
+                kwargs['port'] = port
+            if peers_from_control_nodes != -1:
+                kwargs['peers_from_control_nodes'] = peers_from_control_nodes
+            if kwargs:
+                kwargs['canonical'] = True
+                instance.receptor_addresses.update_or_create(address=instance.hostname, defaults=kwargs)
+
+        return instance
+
+    def create(self, validated_data):
+        return self.create_or_update(validated_data, create=True)
+
+    def update(self, obj, validated_data):
+        return self.create_or_update(validated_data, obj, create=False)
 
     def get_summary_fields(self, obj):
         summary = super().get_summary_fields(obj)
@@ -4966,6 +5506,16 @@ class InstanceSerializer(BaseSerializer):
             summary['links'] = InstanceLinkSerializer(InstanceLink.objects.select_related('target', 'source').filter(source=obj), many=True).data
 
         return summary
+
+    def get_reverse_peers(self, obj):
+        return Instance.objects.prefetch_related('peers').filter(peers__in=obj.receptor_addresses.all()).values_list('id', flat=True)
+
+    def get_protocol(self, obj):
+        # note: don't create a different query for receptor addresses, as this is prefetched on the View for optimization
+        for addr in obj.receptor_addresses.all():
+            if addr.canonical:
+                return addr.protocol
+        return ""
 
     def get_consumed_capacity(self, obj):
         return obj.consumed_capacity
@@ -4979,22 +5529,30 @@ class InstanceSerializer(BaseSerializer):
     def get_health_check_pending(self, obj):
         return obj.health_check_pending
 
-    def validate(self, data):
-        if self.instance:
-            if self.instance.node_type == Instance.Types.HOP:
-                raise serializers.ValidationError("Hop node instances may not be changed.")
-        else:
-            if not settings.IS_K8S:
-                raise serializers.ValidationError("Can only create instances on Kubernetes or OpenShift.")
-        return data
+    def validate(self, attrs):
+        # Oddly, using 'source' on a DRF field populates attrs with the source name, so we should rename it back
+        if 'canonical_address_port' in attrs:
+            attrs['listener_port'] = attrs.pop('canonical_address_port')
+        if 'canonical_address_peers_from_control_nodes' in attrs:
+            attrs['peers_from_control_nodes'] = attrs.pop('canonical_address_peers_from_control_nodes')
+
+        if not self.instance and not settings.IS_K8S:
+            raise serializers.ValidationError(_("Can only create instances on Kubernetes or OpenShift."))
+
+        # cannot enable peers_from_control_nodes if listener_port is not set
+        if attrs.get('peers_from_control_nodes'):
+            port = attrs.get('listener_port', -1)  # -1 denotes missing, None denotes explicit null
+            if (port is None) or (port == -1 and self.instance and self.instance.canonical_address is None):
+                raise serializers.ValidationError(_("Cannot enable peers_from_control_nodes if listener_port is not set."))
+
+        return super().validate(attrs)
 
     def validate_node_type(self, value):
-        if not self.instance:
-            if value not in (Instance.Types.EXECUTION,):
-                raise serializers.ValidationError("Can only create execution nodes.")
-        else:
-            if self.instance.node_type != value:
-                raise serializers.ValidationError("Cannot change node type.")
+        if not self.instance and value not in [Instance.Types.HOP, Instance.Types.EXECUTION]:
+            raise serializers.ValidationError(_("Can only create execution or hop nodes."))
+
+        if self.instance and self.instance.node_type != value:
+            raise serializers.ValidationError(_("Cannot change node type."))
 
         return value
 
@@ -5002,30 +5560,71 @@ class InstanceSerializer(BaseSerializer):
         if self.instance:
             if value != self.instance.node_state:
                 if not settings.IS_K8S:
-                    raise serializers.ValidationError("Can only change the state on Kubernetes or OpenShift.")
+                    raise serializers.ValidationError(_("Can only change the state on Kubernetes or OpenShift."))
                 if value != Instance.States.DEPROVISIONING:
-                    raise serializers.ValidationError("Can only change instances to the 'deprovisioning' state.")
-                if self.instance.node_type not in (Instance.Types.EXECUTION,):
-                    raise serializers.ValidationError("Can only deprovision execution nodes.")
+                    raise serializers.ValidationError(_("Can only change instances to the 'deprovisioning' state."))
+                if self.instance.managed:
+                    raise serializers.ValidationError(_("Cannot deprovision managed nodes."))
         else:
             if value and value != Instance.States.INSTALLED:
-                raise serializers.ValidationError("Can only create instances in the 'installed' state.")
+                raise serializers.ValidationError(_("Can only create instances in the 'installed' state."))
 
         return value
 
     def validate_hostname(self, value):
         """
-        - Hostname cannot be "localhost" - but can be something like localhost.domain
-        - Cannot change the hostname of an-already instantiated & initialized Instance object
+        Cannot change the hostname
         """
         if self.instance and self.instance.hostname != value:
-            raise serializers.ValidationError("Cannot change hostname.")
+            raise serializers.ValidationError(_("Cannot change hostname."))
 
         return value
 
     def validate_listener_port(self, value):
-        if self.instance and self.instance.listener_port != value:
-            raise serializers.ValidationError("Cannot change listener port.")
+        """
+        Cannot change listener port, unless going from none to integer, and vice versa
+        If instance is managed, cannot change listener port at all
+        """
+        if self.instance:
+            canonical_address_port = self.instance.canonical_address_port
+            if value and canonical_address_port and canonical_address_port != value:
+                raise serializers.ValidationError(_("Cannot change listener port."))
+            if self.instance.managed and value != canonical_address_port:
+                raise serializers.ValidationError(_("Cannot change listener port for managed nodes."))
+        return value
+
+    def validate_peers(self, value):
+        # cannot peer to an instance more than once
+        peers_instances = Counter(p.instance_id for p in value)
+        if any(count > 1 for count in peers_instances.values()):
+            raise serializers.ValidationError(_("Cannot peer to the same instance more than once."))
+
+        if self.instance:
+            instance_addresses = set(self.instance.receptor_addresses.all())
+            setting_peers = set(value)
+            peers_changed = set(self.instance.peers.all()) != setting_peers
+
+            if not settings.IS_K8S and peers_changed:
+                raise serializers.ValidationError(_("Cannot change peers."))
+
+            if self.instance.managed and peers_changed:
+                raise serializers.ValidationError(_("Setting peers manually for managed nodes is not allowed."))
+
+            # cannot peer to self
+            if instance_addresses & setting_peers:
+                raise serializers.ValidationError(_("Instance cannot peer to its own address."))
+
+            # cannot peer to an instance that is already peered to this instance
+            if instance_addresses:
+                for p in setting_peers:
+                    if set(p.instance.peers.all()) & instance_addresses:
+                        raise serializers.ValidationError(_(f"Instance {p.instance.hostname} is already peered to this instance."))
+
+        return value
+
+    def validate_peers_from_control_nodes(self, value):
+        if self.instance and self.instance.managed and self.instance.canonical_address_peers_from_control_nodes != value:
+            raise serializers.ValidationError(_("Cannot change peers_from_control_nodes for managed nodes."))
 
         return value
 
@@ -5033,12 +5632,49 @@ class InstanceSerializer(BaseSerializer):
 class InstanceHealthCheckSerializer(BaseSerializer):
     class Meta:
         model = Instance
-        read_only_fields = ('uuid', 'hostname', 'version', 'last_health_check', 'errors', 'cpu', 'memory', 'cpu_capacity', 'mem_capacity', 'capacity')
+        read_only_fields = (
+            'uuid',
+            'hostname',
+            'ip_address',
+            'version',
+            'last_health_check',
+            'errors',
+            'cpu',
+            'memory',
+            'cpu_capacity',
+            'mem_capacity',
+            'capacity',
+        )
+        fields = read_only_fields
+
+
+class HostMetricSerializer(BaseSerializer):
+    show_capabilities = ['delete']
+
+    class Meta:
+        model = HostMetric
+        fields = (
+            "id",
+            "hostname",
+            "url",
+            "first_automation",
+            "last_automation",
+            "last_deleted",
+            "automated_counter",
+            "deleted_counter",
+            "deleted",
+            "used_in_inventories",
+        )
+
+
+class HostMetricSummaryMonthlySerializer(BaseSerializer):
+    class Meta:
+        model = HostMetricSummaryMonthly
+        read_only_fields = ("id", "date", "license_consumed", "license_capacity", "hosts_added", "hosts_deleted", "indirectly_managed_hosts")
         fields = read_only_fields
 
 
 class InstanceGroupSerializer(BaseSerializer):
-
     show_capabilities = ['edit', 'delete']
     capacity = serializers.SerializerMethodField()
     consumed_capacity = serializers.SerializerMethodField()
@@ -5048,7 +5684,7 @@ class InstanceGroupSerializer(BaseSerializer):
     instances = serializers.SerializerMethodField()
     is_container_group = serializers.BooleanField(
         required=False,
-        help_text=_('Indicates whether instances in this group are containerized.' 'Containerized groups have a designated Openshift or Kubernetes cluster.'),
+        help_text=_('Indicates whether instances in this group are containerized.Containerized groups have a designated Openshift or Kubernetes cluster.'),
     )
     # NOTE: help_text is duplicated from field definitions, no obvious way of
     # both defining field details here and also getting the field's help_text
@@ -5059,7 +5695,7 @@ class InstanceGroupSerializer(BaseSerializer):
         required=False,
         initial=0,
         label=_('Policy Instance Percentage'),
-        help_text=_("Minimum percentage of all instances that will be automatically assigned to " "this group when new instances come online."),
+        help_text=_("Minimum percentage of all instances that will be automatically assigned to this group when new instances come online."),
     )
     policy_instance_minimum = serializers.IntegerField(
         default=0,
@@ -5067,7 +5703,7 @@ class InstanceGroupSerializer(BaseSerializer):
         required=False,
         initial=0,
         label=_('Policy Instance Minimum'),
-        help_text=_("Static minimum number of Instances that will be automatically assign to " "this group when new instances come online."),
+        help_text=_("Static minimum number of Instances that will be automatically assign to this group when new instances come online."),
     )
     max_concurrent_jobs = serializers.IntegerField(
         default=0,
@@ -5123,6 +5759,8 @@ class InstanceGroupSerializer(BaseSerializer):
         res = super(InstanceGroupSerializer, self).get_related(obj)
         res['jobs'] = self.reverse('api:instance_group_unified_jobs_list', kwargs={'pk': obj.pk})
         res['instances'] = self.reverse('api:instance_group_instance_list', kwargs={'pk': obj.pk})
+        res['access_list'] = self.reverse('api:instance_group_access_list', kwargs={'pk': obj.pk})
+        res['object_roles'] = self.reverse('api:instance_group_object_role_list', kwargs={'pk': obj.pk})
         if obj.credential:
             res['credential'] = self.reverse('api:credential_detail', kwargs={'pk': obj.credential_id})
 
@@ -5225,7 +5863,6 @@ class InstanceGroupSerializer(BaseSerializer):
 
 
 class ActivityStreamSerializer(BaseSerializer):
-
     changes = serializers.SerializerMethodField()
     object_association = serializers.SerializerMethodField(help_text=_("When present, shows the field name of the role or relationship that changed."))
     object_type = serializers.SerializerMethodField(help_text=_("When present, shows the model on which the role or relationship was defined."))
@@ -5243,8 +5880,6 @@ class ActivityStreamSerializer(BaseSerializer):
             ('workflow_job_template_node', ('id', 'unified_job_template_id')),
             ('label', ('id', 'name', 'organization_id')),
             ('notification', ('id', 'status', 'notification_type', 'notification_template_id')),
-            ('o_auth2_access_token', ('id', 'user_id', 'description', 'application_id', 'scope')),
-            ('o_auth2_application', ('id', 'name', 'description')),
             ('credential_type', ('id', 'name', 'description', 'kind', 'managed')),
             ('ad_hoc_command', ('id', 'name', 'status', 'limit')),
             ('workflow_approval', ('id', 'name', 'unified_job_id')),

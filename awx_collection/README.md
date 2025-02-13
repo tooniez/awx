@@ -32,17 +32,10 @@ Installing the `tar.gz` involves no special instructions.
 ## Running
 
 Non-deprecated modules in this collection have no Python requirements, but
-may require the official [AWX CLI](https://docs.ansible.com/ansible-tower/latest/html/towercli/index.html)
+may require the official [AWX CLI](https://pypi.org/project/awxkit/)
 in the future. The `DOCUMENTATION` for each module will report this.
 
-You can specify authentication by a combination of either:
-
- - host, username, password
- - host, OAuth2 token
-
-The OAuth2 token is the preferred method. You can obtain a token via the
-AWX CLI [login](https://docs.ansible.com/ansible-tower/latest/html/towercli/reference.html#awx-login)
-command.
+You can specify authentication by host, username, and password.
 
 These can be specified via (from highest to lowest precedence):
 
@@ -58,7 +51,8 @@ Config file syntax looks like this:
 [general]
 host = https://localhost:8043
 verify_ssl = true
-oauth_token = LEdCpKVKc4znzffcpQL5vLG8oyeku6
+username = foo
+password = bar
 ```
 
 ## Release and Upgrade Notes
@@ -68,6 +62,9 @@ Notable releases of the `awx.awx` collection:
  - 7.0.0 is intended to be identical to the content prior to the migration, aside from changes necessary to function as a collection.
  - 11.0.0 has no non-deprecated modules that depend on the deprecated `tower-cli` [PyPI](https://pypi.org/project/ansible-tower-cli/).
  - 19.2.1 large renaming purged "tower" names (like options and module names), adding redirects for old names
+ - 21.11.0 "tower" modules deprecated and symlinks removed.
+ - 25.0.0 "token" and "application" modules have been removed as oauth is no longer supported, use basic auth instead
+ - X.X.X added support of named URLs to all modules. Anywhere that previously accepted name or id can also support named URLs
  - 0.0.1-devel is the version you should see if installing from source, which is intended for development and expected to be unstable.
 
 The following notes are changes that may require changes to playbooks:
@@ -100,6 +97,7 @@ The following notes are changes that may require changes to playbooks:
  - The `notification_configuration` parameter of `tower_notification_template` has changed from a string to a dict. Please use the `lookup` plugin to read an existing file into a dict.
  - `tower_credential` no longer supports passing a file name to `ssh_key_data`.
  - The HipChat `notification_type` has been removed and can no longer be created using the `tower_notification_template` module.
+ - Lookup plugins now always return a list, and if you want a scalar value use `lookup` as opposed to `query`
 
 ## Running Unit Tests
 
@@ -111,7 +109,7 @@ Ansible source, set up a dedicated virtual environment:
 
 ```
 mkvirtualenv my_new_venv
-# may need to replace psycopg2 with psycopg2-binary in requirements/requirements.txt
+# may need to replace psycopg3 with psycopg3-binary in requirements/requirements.txt
 pip install -r requirements/requirements.txt -r requirements/requirements_dev.txt -r requirements/requirements_git.txt
 make clean-api
 pip install -e <path to your Ansible>

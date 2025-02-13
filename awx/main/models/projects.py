@@ -5,6 +5,8 @@
 import datetime
 import os
 import urllib.parse as urlparse
+from uuid import uuid4
+import logging
 
 # Django
 from django.conf import settings
@@ -33,17 +35,18 @@ from awx.main.models.mixins import ResourceMixin, TaskManagerProjectUpdateMixin,
 from awx.main.utils import update_scm_url, polymorphic
 from awx.main.utils.ansible import skip_directory, could_be_inventory, could_be_playbook
 from awx.main.utils.execution_environments import get_control_plane_execution_environment
-from awx.main.fields import ImplicitRoleField, JSONBlob
+from awx.main.fields import ImplicitRoleField
 from awx.main.models.rbac import (
     ROLE_SINGLETON_SYSTEM_ADMINISTRATOR,
     ROLE_SINGLETON_SYSTEM_AUDITOR,
 )
 
+logger = logging.getLogger('awx.main.models.projects')
+
 __all__ = ['Project', 'ProjectUpdate']
 
 
 class ProjectOptions(models.Model):
-
     SCM_TYPE_CHOICES = [
         ('', _('Manual')),
         ('git', _('Git')),
@@ -75,7 +78,7 @@ class ProjectOptions(models.Model):
             return []
 
     local_path = models.CharField(
-        max_length=1024, blank=True, help_text=_('Local path (relative to PROJECTS_ROOT) containing ' 'playbooks and related files for this project.')
+        max_length=1024, blank=True, help_text=_('Local path (relative to PROJECTS_ROOT) containing playbooks and related files for this project.')
     )
 
     scm_type = models.CharField(
@@ -260,6 +263,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
     class Meta:
         app_label = 'main'
         ordering = ('id',)
+        permissions = [('update_project', 'Can run a project update'), ('use_project', 'Can use project in a job template')]
 
     default_environment = models.ForeignKey(
         'ExecutionEnvironment',
@@ -277,11 +281,11 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
     scm_update_cache_timeout = models.PositiveIntegerField(
         default=0,
         blank=True,
-        help_text=_('The number of seconds after the last project update ran that a new ' 'project update will be launched as a job dependency.'),
+        help_text=_('The number of seconds after the last project update ran that a new project update will be launched as a job dependency.'),
     )
     allow_override = models.BooleanField(
         default=False,
-        help_text=_('Allow changing the SCM branch or revision in a job template ' 'that uses this project.'),
+        help_text=_('Allow changing the SCM branch or revision in a job template that uses this project.'),
     )
 
     # credential (keys) used to validate content signature
@@ -304,7 +308,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         help_text=_('The last revision fetched by a project update'),
     )
 
-    playbook_files = JSONBlob(
+    playbook_files = models.JSONField(
         default=list,
         blank=True,
         editable=False,
@@ -312,7 +316,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         help_text=_('List of playbooks found in the project'),
     )
 
-    inventory_files = JSONBlob(
+    inventory_files = models.JSONField(
         default=list,
         blank=True,
         editable=False,
@@ -447,7 +451,25 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
 
     @property
     def cache_id(self):
-        return str(self.last_job_id)
+        """This gives the folder name where collections and roles will be saved to so it does not re-download
+
+        Normally we want this to track with the last update, because every update should pull new content.
+        This does not count sync jobs, but sync jobs do not update last_job or current_job anyway.
+        If cleanup_jobs deletes the last jobs, then we can fallback to using any given heuristic related
+        to the last job ran.
+        """
+        if self.current_job_id:
+            return str(self.current_job_id)
+        elif self.last_job_id:
+            return str(self.last_job_id)
+        elif self.last_job_run:
+            return self.last_job_run.isoformat()
+        else:
+            logger.warning(f'No info about last update for project {self.id}, content cache may misbehave')
+            if self.modified:
+                return self.modified.isoformat()
+            else:
+                return str(uuid4())
 
     @property
     def notification_templates(self):
@@ -480,7 +502,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         RunProjectUpdate/RunInventoryUpdate.
         """
 
-        if self.status not in ('error', 'failed'):
+        if self.status not in ('error', 'failed') or self.scm_update_on_launch:
             return None
 
         latest_update = self.project_updates.last()
@@ -618,7 +640,7 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
     @property
     def cache_id(self):
         if self.branch_override or self.job_type == 'check' or (not self.project):
-            return str(self.id)
+            return str(self.id)  # causes it to not use the cache, basically
         return self.project.cache_id
 
     def result_stdout_raw_limited(self, start_line=0, end_line=None, redact_sensitive=True):
@@ -631,7 +653,7 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
         return reverse('api:project_update_detail', kwargs={'pk': self.pk}, request=request)
 
     def get_ui_url(self):
-        return urlparse.urljoin(settings.TOWER_URL_BASE, "/#/jobs/project/{}".format(self.pk))
+        return urlparse.urljoin(settings.TOWER_URL_BASE, "{}/jobs/project/{}".format(settings.OPTIONAL_UI_URL_PREFIX, self.pk))
 
     def cancel(self, job_explanation=None, is_chain=False):
         res = super(ProjectUpdate, self).cancel(job_explanation=job_explanation, is_chain=is_chain)

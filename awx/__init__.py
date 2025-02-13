@@ -5,6 +5,7 @@ from __future__ import absolute_import, unicode_literals
 import os
 import sys
 import warnings
+from importlib.metadata import PackageNotFoundError, version as _get_version
 
 
 def get_version():
@@ -34,10 +35,8 @@ def version_file():
 
 
 try:
-    import pkg_resources
-
-    __version__ = pkg_resources.get_distribution('awx').version
-except pkg_resources.DistributionNotFound:
+    __version__ = _get_version('awx')
+except PackageNotFoundError:
     __version__ = get_version()
 
 __all__ = ['__version__']
@@ -52,75 +51,13 @@ try:
 except ImportError:  # pragma: no cover
     MODE = 'production'
 
-import hashlib
 
 try:
     import django  # noqa: F401
-
-    HAS_DJANGO = True
 except ImportError:
-    HAS_DJANGO = False
+    pass
 else:
-    from django.db.backends.base import schema
-    from django.db.models import indexes
-    from django.db.backends.utils import names_digest
     from django.db import connection
-
-if HAS_DJANGO is True:
-
-    # See upgrade blocker note in requirements/README.md
-    try:
-        names_digest('foo', 'bar', 'baz', length=8)
-    except ValueError:
-
-        def names_digest(*args, length):
-            """
-            Generate a 32-bit digest of a set of arguments that can be used to shorten
-            identifying names.  Support for use in FIPS environments.
-            """
-            h = hashlib.md5(usedforsecurity=False)
-            for arg in args:
-                h.update(arg.encode())
-            return h.hexdigest()[:length]
-
-        schema.names_digest = names_digest
-        indexes.names_digest = names_digest
-
-
-def find_commands(management_dir):
-    # Modified version of function from django/core/management/__init__.py.
-    command_dir = os.path.join(management_dir, 'commands')
-    commands = []
-    try:
-        for f in os.listdir(command_dir):
-            if f.startswith('_'):
-                continue
-            elif f.endswith('.py') and f[:-3] not in commands:
-                commands.append(f[:-3])
-            elif f.endswith('.pyc') and f[:-4] not in commands:  # pragma: no cover
-                commands.append(f[:-4])
-    except OSError:
-        pass
-    return commands
-
-
-def oauth2_getattribute(self, attr):
-    # Custom method to override
-    # oauth2_provider.settings.OAuth2ProviderSettings.__getattribute__
-    from django.conf import settings
-    from oauth2_provider.settings import DEFAULTS
-
-    val = None
-    if (isinstance(attr, str)) and (attr in DEFAULTS) and (not attr.startswith('_')):
-        # certain Django OAuth Toolkit migrations actually reference
-        # setting lookups for references to model classes (e.g.,
-        # oauth2_settings.REFRESH_TOKEN_MODEL)
-        # If we're doing an OAuth2 setting lookup *while running* a migration,
-        # don't do our usual database settings lookup
-        val = settings.OAUTH2_PROVIDER.get(attr)
-    if val is None:
-        val = object.__getattribute__(self, attr)
-    return val
 
 
 def prepare_env():
@@ -132,45 +69,6 @@ def prepare_env():
 
     if not settings.DEBUG:  # pragma: no cover
         warnings.simplefilter('ignore', DeprecationWarning)
-    # Monkeypatch Django find_commands to also work with .pyc files.
-    import django.core.management
-
-    django.core.management.find_commands = find_commands
-
-    # Monkeypatch Oauth2 toolkit settings class to check for settings
-    # in django.conf settings each time, not just once during import
-    import oauth2_provider.settings
-
-    oauth2_provider.settings.OAuth2ProviderSettings.__getattribute__ = oauth2_getattribute
-
-    # Use the AWX_TEST_DATABASE_* environment variables to specify the test
-    # database settings to use when management command is run as an external
-    # program via unit tests.
-    for opt in ('ENGINE', 'NAME', 'USER', 'PASSWORD', 'HOST', 'PORT'):  # pragma: no cover
-        if os.environ.get('AWX_TEST_DATABASE_%s' % opt, None):
-            settings.DATABASES['default'][opt] = os.environ['AWX_TEST_DATABASE_%s' % opt]
-    # Disable capturing all SQL queries in memory when in DEBUG mode.
-    if settings.DEBUG and not getattr(settings, 'SQL_DEBUG', True):
-        from django.db.backends.base.base import BaseDatabaseWrapper
-        from django.db.backends.utils import CursorWrapper
-
-        BaseDatabaseWrapper.make_debug_cursor = lambda self, cursor: CursorWrapper(cursor, self)
-
-    # Use the default devserver addr/port defined in settings for runserver.
-    default_addr = getattr(settings, 'DEVSERVER_DEFAULT_ADDR', '127.0.0.1')
-    default_port = getattr(settings, 'DEVSERVER_DEFAULT_PORT', 8000)
-    from django.core.management.commands import runserver as core_runserver
-
-    original_handle = core_runserver.Command.handle
-
-    def handle(self, *args, **options):
-        if not options.get('addrport'):
-            options['addrport'] = '%s:%d' % (default_addr, int(default_port))
-        elif options.get('addrport').isdigit():
-            options['addrport'] = '%s:%d' % (default_addr, int(options['addrport']))
-        return original_handle(self, *args, **options)
-
-    core_runserver.Command.handle = handle
 
 
 def manage():
@@ -180,10 +78,12 @@ def manage():
     from django.conf import settings
     from django.core.management import execute_from_command_line
 
-    # enforce the postgres version is equal to 12. if not, then terminate program with exit code of 1
+    # enforce the postgres version is a minimum of 12 (we need this for partitioning); if not, then terminate program with exit code of 1
+    # In the future if we require a feature of a version of postgres > 12 this should be updated to reflect that.
+    # The return of connection.pg_version is something like 12013
     if not os.getenv('SKIP_PG_VERSION_CHECK', False) and not MODE == 'development':
         if (connection.pg_version // 10000) < 12:
-            sys.stderr.write("Postgres version 12 is required\n")
+            sys.stderr.write("At a minimum, postgres version 12 is required\n")
             sys.exit(1)
 
     if len(sys.argv) >= 2 and sys.argv[1] in ('version', '--version'):  # pragma: no cover

@@ -19,7 +19,6 @@ def rebuild_jt_parents(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('main', '0108_v370_unifiedjob_dependencies_processed'),
     ]
@@ -81,7 +80,7 @@ class Migration(migrations.Migration):
             field=awx.main.fields.ImplicitRoleField(
                 editable=False,
                 null='True',
-                on_delete=django.db.models.deletion.CASCADE,
+                on_delete=django.db.models.deletion.SET_NULL,
                 parent_role=['organization.job_template_admin_role'],
                 related_name='+',
                 to='main.Role',
@@ -93,7 +92,7 @@ class Migration(migrations.Migration):
             field=awx.main.fields.ImplicitRoleField(
                 editable=False,
                 null='True',
-                on_delete=django.db.models.deletion.CASCADE,
+                on_delete=django.db.models.deletion.SET_NULL,
                 parent_role=['admin_role', 'organization.execute_role'],
                 related_name='+',
                 to='main.Role',
@@ -105,7 +104,7 @@ class Migration(migrations.Migration):
             field=awx.main.fields.ImplicitRoleField(
                 editable=False,
                 null='True',
-                on_delete=django.db.models.deletion.CASCADE,
+                on_delete=django.db.models.deletion.SET_NULL,
                 parent_role=['organization.auditor_role', 'inventory.organization.auditor_role', 'execute_role', 'admin_role'],
                 related_name='+',
                 to='main.Role',

@@ -57,7 +57,7 @@ def _mk_inventory_update(created=None):
         [_mk_inventory_update, InventoryUpdateEvent, 'inventory_update', 'api:inventory_update_stdout'],
     ],
 )
-def test_text_stdout(sqlite_copy_expert, Parent, Child, relation, view, get, admin):
+def test_text_stdout(sqlite_copy, Parent, Child, relation, view, get, admin):
     job = Parent()
     job.save()
     for i in range(3):
@@ -79,11 +79,11 @@ def test_text_stdout(sqlite_copy_expert, Parent, Child, relation, view, get, adm
     ],
 )
 @pytest.mark.parametrize('download', [True, False])
-def test_ansi_stdout_filtering(sqlite_copy_expert, Parent, Child, relation, view, download, get, admin):
+def test_ansi_stdout_filtering(sqlite_copy, Parent, Child, relation, view, download, get, admin):
     job = Parent()
     job.save()
     for i in range(3):
-        Child(**{relation: job, 'stdout': '\x1B[0;36mTesting {}\x1B[0m\n'.format(i), 'start_line': i}).save()
+        Child(**{relation: job, 'stdout': '\x1b[0;36mTesting {}\x1b[0m\n'.format(i), 'start_line': i}).save()
     url = reverse(view, kwargs={'pk': job.pk})
 
     # ansi codes in ?format=txt should get filtered
@@ -96,7 +96,7 @@ def test_ansi_stdout_filtering(sqlite_copy_expert, Parent, Child, relation, view
     # ask for ansi and you'll get it
     fmt = "?format={}".format("ansi_download" if download else "ansi")
     response = get(url + fmt, user=admin, expect=200)
-    assert smart_str(response.content).splitlines() == ['\x1B[0;36mTesting %d\x1B[0m' % i for i in range(3)]
+    assert smart_str(response.content).splitlines() == ['\x1b[0;36mTesting %d\x1b[0m' % i for i in range(3)]
     has_download_header = response.has_header('Content-Disposition')
     assert has_download_header if download else not has_download_header
 
@@ -111,11 +111,11 @@ def test_ansi_stdout_filtering(sqlite_copy_expert, Parent, Child, relation, view
         [_mk_inventory_update, InventoryUpdateEvent, 'inventory_update', 'api:inventory_update_stdout'],
     ],
 )
-def test_colorized_html_stdout(sqlite_copy_expert, Parent, Child, relation, view, get, admin):
+def test_colorized_html_stdout(sqlite_copy, Parent, Child, relation, view, get, admin):
     job = Parent()
     job.save()
     for i in range(3):
-        Child(**{relation: job, 'stdout': '\x1B[0;36mTesting {}\x1B[0m\n'.format(i), 'start_line': i}).save()
+        Child(**{relation: job, 'stdout': '\x1b[0;36mTesting {}\x1b[0m\n'.format(i), 'start_line': i}).save()
     url = reverse(view, kwargs={'pk': job.pk}) + '?format=html'
 
     response = get(url, user=admin, expect=200)
@@ -134,7 +134,7 @@ def test_colorized_html_stdout(sqlite_copy_expert, Parent, Child, relation, view
         [_mk_inventory_update, InventoryUpdateEvent, 'inventory_update', 'api:inventory_update_stdout'],
     ],
 )
-def test_stdout_line_range(sqlite_copy_expert, Parent, Child, relation, view, get, admin):
+def test_stdout_line_range(sqlite_copy, Parent, Child, relation, view, get, admin):
     job = Parent()
     job.save()
     for i in range(20):
@@ -146,7 +146,7 @@ def test_stdout_line_range(sqlite_copy_expert, Parent, Child, relation, view, ge
 
 
 @pytest.mark.django_db
-def test_text_stdout_from_system_job_events(sqlite_copy_expert, get, admin):
+def test_text_stdout_from_system_job_events(sqlite_copy, get, admin):
     created = tz_now()
     job = SystemJob(created=created)
     job.save()
@@ -158,7 +158,7 @@ def test_text_stdout_from_system_job_events(sqlite_copy_expert, get, admin):
 
 
 @pytest.mark.django_db
-def test_text_stdout_with_max_stdout(sqlite_copy_expert, get, admin):
+def test_text_stdout_with_max_stdout(sqlite_copy, get, admin):
     created = tz_now()
     job = SystemJob(created=created)
     job.save()
@@ -185,7 +185,7 @@ def test_text_stdout_with_max_stdout(sqlite_copy_expert, get, admin):
 )
 @pytest.mark.parametrize('fmt', ['txt', 'ansi'])
 @mock.patch('awx.main.redact.UriCleaner.SENSITIVE_URI_PATTERN', mock.Mock(**{'search.return_value': None}))  # really slow for large strings
-def test_max_bytes_display(sqlite_copy_expert, Parent, Child, relation, view, fmt, get, admin):
+def test_max_bytes_display(sqlite_copy, Parent, Child, relation, view, fmt, get, admin):
     created = tz_now()
     job = Parent(created=created)
     job.save()
@@ -255,7 +255,7 @@ def test_legacy_result_stdout_with_max_bytes(Cls, view, fmt, get, admin):
     ],
 )
 @pytest.mark.parametrize('fmt', ['txt', 'ansi', 'txt_download', 'ansi_download'])
-def test_text_with_unicode_stdout(sqlite_copy_expert, Parent, Child, relation, view, get, admin, fmt):
+def test_text_with_unicode_stdout(sqlite_copy, Parent, Child, relation, view, get, admin, fmt):
     job = Parent()
     job.save()
     for i in range(3):
@@ -267,7 +267,7 @@ def test_text_with_unicode_stdout(sqlite_copy_expert, Parent, Child, relation, v
 
 
 @pytest.mark.django_db
-def test_unicode_with_base64_ansi(sqlite_copy_expert, get, admin):
+def test_unicode_with_base64_ansi(sqlite_copy, get, admin):
     created = tz_now()
     job = Job(created=created)
     job.save()

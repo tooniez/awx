@@ -1,17 +1,20 @@
 # Python
 import contextlib
 import logging
+import psycopg
 import threading
 import time
 import os
+
+from concurrent.futures import ThreadPoolExecutor
 
 # Django
 from django.conf import LazySettings
 from django.conf import settings, UserSettingsHolder
 from django.core.cache import cache as django_cache
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, SynchronousOnlyOperation
 from django.db import transaction, connection
-from django.db.utils import Error as DBError, ProgrammingError
+from django.db.utils import DatabaseError, ProgrammingError
 from django.utils.functional import cached_property
 
 # Django REST Framework
@@ -78,18 +81,29 @@ def _ctit_db_wrapper(trans_safe=False):
                     logger.debug('Obtaining database settings in spite of broken transaction.')
                     transaction.set_rollback(False)
         yield
-    except DBError as exc:
+    except ProgrammingError as e:
+        # Exception raised for programming errors
+        # Examples may be table not found or already exists,
+        # this generally means we can't fetch Tower configuration
+        # because the database hasn't actually finished migrating yet;
+        # this is usually a sign that a service in a container (such as ws_broadcast)
+        # has come up *before* the database has finished migrating, and
+        # especially that the conf.settings table doesn't exist yet
+        # syntax error in the SQL statement, wrong number of parameters specified, etc.
         if trans_safe:
-            level = logger.warning
-            if isinstance(exc, ProgrammingError):
-                if 'relation' in str(exc) and 'does not exist' in str(exc):
-                    # this generally means we can't fetch Tower configuration
-                    # because the database hasn't actually finished migrating yet;
-                    # this is usually a sign that a service in a container (such as ws_broadcast)
-                    # has come up *before* the database has finished migrating, and
-                    # especially that the conf.settings table doesn't exist yet
-                    level = logger.debug
-            level(f'Database settings are not available, using defaults. error: {str(exc)}')
+            logger.debug(f'Database settings are not available, using defaults. error: {str(e)}')
+        else:
+            logger.exception('Error modifying something related to database settings.')
+    except DatabaseError as e:
+        if trans_safe:
+            cause = e.__cause__
+            sqlstate = getattr(cause, 'sqlstate', None)
+            if cause and sqlstate:
+                sqlstate = cause.sqlstate
+                sqlstate_str = psycopg.errors.lookup(sqlstate)
+                logger.error('SQL Error state: {} - {}'.format(sqlstate, sqlstate_str))
+            else:
+                logger.error(f'Error reading something related to database settings: {str(e)}.')
         else:
             logger.exception('Error modifying something related to database settings.')
     finally:
@@ -104,7 +118,6 @@ def filter_sensitive(registry, key, value):
 
 
 class TransientSetting(object):
-
     __slots__ = ('pk', 'value')
 
     def __init__(self, pk, value):
@@ -158,7 +171,7 @@ class EncryptedCacheProxy(object):
             obj_id = self.cache.get(Setting.get_cache_id_key(key), default=empty)
             if obj_id is empty:
                 logger.info('Efficiency notice: Corresponding id not stored in cache %s', Setting.get_cache_id_key(key))
-                obj_id = getattr(self._get_setting_from_db(key), 'pk', None)
+                obj_id = getattr(_get_setting_from_db(self.registry, key), 'pk', None)
             elif obj_id == SETTING_CACHE_NONE:
                 obj_id = None
             return method(TransientSetting(pk=obj_id, value=value), 'value')
@@ -166,11 +179,6 @@ class EncryptedCacheProxy(object):
         # If the field in question isn't an "encrypted" field, this function is
         # a no-op; it just returns the provided value
         return value
-
-    def _get_setting_from_db(self, key):
-        field = self.registry.get_setting_field(key)
-        if not field.read_only:
-            return Setting.objects.filter(key=key, user__isnull=True).order_by('pk').first()
 
     def __getattr__(self, name):
         return getattr(self.cache, name)
@@ -185,6 +193,22 @@ def get_writeable_settings(registry):
 
 def get_settings_to_cache(registry):
     return dict([(key, SETTING_CACHE_NOTSET) for key in get_writeable_settings(registry)])
+
+
+# Will first attempt to get the setting from the database in synchronous mode.
+# If call from async context, it will attempt to get the setting from the database in a thread.
+def _get_setting_from_db(registry, key):
+    def get_settings_from_db_sync(registry, key):
+        field = registry.get_setting_field(key)
+        if not field.read_only or key == 'INSTALL_UUID':
+            return Setting.objects.filter(key=key, user__isnull=True).order_by('pk').first()
+
+    try:
+        return get_settings_from_db_sync(registry, key)
+    except SynchronousOnlyOperation:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(get_settings_from_db_sync, registry, key)
+            return future.result()
 
 
 def get_cache_value(value):
@@ -346,7 +370,7 @@ class SettingsWrapper(UserSettingsHolder):
             setting_id = None
             # this value is read-only, however we *do* want to fetch its value from the database
             if not field.read_only or name == 'INSTALL_UUID':
-                setting = Setting.objects.filter(key=name, user__isnull=True).order_by('pk').first()
+                setting = _get_setting_from_db(self.registry, name)
             if setting:
                 if getattr(field, 'encrypted', False):
                     value = decrypt_field(setting, 'value')
@@ -406,6 +430,10 @@ class SettingsWrapper(UserSettingsHolder):
         """Get value while accepting the in-memory cache if key is available"""
         with _ctit_db_wrapper(trans_safe=True):
             return self._get_local(name)
+        # If the last line did not return, that means we hit a database error
+        # in that case, we should not have a local cache value
+        # thus, return empty as a signal to use the default
+        return empty
 
     def __getattr__(self, name):
         value = empty

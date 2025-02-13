@@ -6,7 +6,6 @@ import re
 from django.utils.translation import gettext_lazy as _
 
 __all__ = [
-    'CLOUD_PROVIDERS',
     'PRIVILEGE_ESCALATION_METHODS',
     'ANSI_SGR_PATTERN',
     'CAN_CANCEL',
@@ -14,7 +13,6 @@ __all__ = [
     'STANDARD_INVENTORY_UPDATE_ENV',
 ]
 
-CLOUD_PROVIDERS = ('azure_rm', 'ec2', 'gce', 'vmware', 'openstack', 'rhv', 'satellite6', 'controller', 'insights')
 PRIVILEGE_ESCALATION_METHODS = [
     ('sudo', _('Sudo')),
     ('su', _('Su')),
@@ -38,9 +36,12 @@ STANDARD_INVENTORY_UPDATE_ENV = {
     'ANSIBLE_INVENTORY_EXPORT': 'True',
     # Redirecting output to stderr allows JSON parsing to still work with -vvv
     'ANSIBLE_VERBOSE_TO_STDERR': 'True',
+    # if ansible-inventory --limit is used for an inventory import, unmatched should be a failure
+    'ANSIBLE_HOST_PATTERN_MISMATCH': 'error',
 }
 CAN_CANCEL = ('new', 'pending', 'waiting', 'running')
 ACTIVE_STATES = CAN_CANCEL
+ERROR_STATES = ('error',)
 MINIMAL_EVENTS = set(['playbook_on_play_start', 'playbook_on_task_start', 'playbook_on_stats', 'EOF'])
 CENSOR_VALUE = '************'
 ENV_BLOCKLIST = frozenset(
@@ -63,7 +64,7 @@ ENV_BLOCKLIST = frozenset(
         'INVENTORY_HOSTVARS',
         'AWX_HOST',
         'PROJECT_REVISION',
-        'SUPERVISOR_WEB_CONFIG_PATH',
+        'SUPERVISOR_CONFIG_PATH',
     )
 )
 
@@ -106,3 +107,34 @@ JOB_VARIABLE_PREFIXES = [
 ANSIBLE_RUNNER_NEEDS_UPDATE_MESSAGE = (
     '\u001b[31m \u001b[1m This can be caused if the version of ansible-runner in your execution environment is out of date.\u001b[0m'
 )
+
+# Values for setting SUBSCRIPTION_USAGE_MODEL
+SUBSCRIPTION_USAGE_MODEL_UNIQUE_HOSTS = 'unique_managed_hosts'
+
+# Shared prefetch to use for creating a queryset for the purpose of writing or saving facts
+HOST_FACTS_FIELDS = ('name', 'ansible_facts', 'ansible_facts_modified', 'modified', 'inventory_id')
+
+# Data for RBAC compatibility layer
+role_name_to_perm_mapping = {
+    'adhoc_role': ['adhoc_'],
+    'approval_role': ['approve_'],
+    'auditor_role': ['audit_'],
+    'admin_role': ['change_', 'add_', 'delete_'],
+    'execute_role': ['execute_'],
+    'read_role': ['view_'],
+    'update_role': ['update_'],
+    'member_role': ['member_'],
+    'use_role': ['use_'],
+}
+
+org_role_to_permission = {
+    'notification_admin_role': 'add_notificationtemplate',
+    'project_admin_role': 'add_project',
+    'execute_role': 'execute_jobtemplate',
+    'inventory_admin_role': 'add_inventory',
+    'credential_admin_role': 'add_credential',
+    'workflow_admin_role': 'add_workflowjobtemplate',
+    'job_template_admin_role': 'change_jobtemplate',  # TODO: this doesnt really work, solution not clear
+    'execution_environment_admin_role': 'add_executionenvironment',
+    'auditor_role': 'view_project',  # TODO: also doesnt really work
+}

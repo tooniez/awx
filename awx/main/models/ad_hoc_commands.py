@@ -12,9 +12,11 @@ from django.utils.text import Truncator
 from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ValidationError
 
+from ansible_base.lib.utils.models import prevent_search
+
 # AWX
 from awx.api.versioning import reverse
-from awx.main.models.base import prevent_search, AD_HOC_JOB_TYPE_CHOICES, VERBOSITY_CHOICES, VarsDictProperty
+from awx.main.models.base import AD_HOC_JOB_TYPE_CHOICES, VERBOSITY_CHOICES, VarsDictProperty
 from awx.main.models.events import AdHocCommandEvent, UnpartitionedAdHocCommandEvent
 from awx.main.models.unified_jobs import UnifiedJob
 from awx.main.models.notifications import JobNotificationMixin, NotificationTemplate
@@ -159,7 +161,7 @@ class AdHocCommand(UnifiedJob, JobNotificationMixin):
         return reverse('api:ad_hoc_command_detail', kwargs={'pk': self.pk}, request=request)
 
     def get_ui_url(self):
-        return urljoin(settings.TOWER_URL_BASE, "/#/jobs/command/{}".format(self.pk))
+        return urljoin(settings.TOWER_URL_BASE, "{}/jobs/command/{}".format(settings.OPTIONAL_UI_URL_PREFIX, self.pk))
 
     @property
     def notification_templates(self):

@@ -4,6 +4,7 @@ import json
 from .stdout import monitor, monitor_workflow
 from .utils import CustomRegistryMeta, color_enabled
 from awxkit import api
+from awxkit.config import config
 from awxkit.exceptions import NoContent
 
 
@@ -44,6 +45,10 @@ class CustomAction(metaclass=CustomActionRegistryMeta):
 
 
 class Launchable(object):
+    @property
+    def options_endpoint(self):
+        return self.page.endpoint + '1/{}/'.format(self.action)
+
     def add_arguments(self, parser, resource_options_parser, with_pk=True):
         from .options import pk_or_name
 
@@ -52,8 +57,13 @@ class Launchable(object):
         parser.choices[self.action].add_argument('--monitor', action='store_true', help='If set, prints stdout of the launched job until it finishes.')
         parser.choices[self.action].add_argument('--action-timeout', type=int, help='If set with --monitor or --wait, time out waiting on job completion.')
         parser.choices[self.action].add_argument('--wait', action='store_true', help='If set, waits until the launched job finishes.')
+        parser.choices[self.action].add_argument(
+            '--interval',
+            type=float,
+            help='If set with --monitor or --wait, amount of time to wait in seconds between api calls. Minimum value is 2.5 seconds to avoid overwhelming the api',
+        )
 
-        launch_time_options = self.page.connection.options(self.page.endpoint + '1/{}/'.format(self.action))
+        launch_time_options = self.page.connection.options(self.options_endpoint)
         if launch_time_options.ok:
             launch_time_options = launch_time_options.json()['actions']['POST']
             resource_options_parser.options['LAUNCH'] = launch_time_options
@@ -62,12 +72,11 @@ class Launchable(object):
     def monitor(self, response, **kwargs):
         mon = monitor_workflow if response.type == 'workflow_job' else monitor
         if kwargs.get('monitor') or kwargs.get('wait'):
-            status = mon(
-                response,
-                self.page.connection.session,
-                print_stdout=not kwargs.get('wait'),
-                action_timeout=kwargs.get('action_timeout'),
-            )
+            monitor_kwargs = {'print_stdout': bool(not kwargs.get('wait'))}
+            for key in ('action_timeout', 'interval'):
+                if key in kwargs:
+                    monitor_kwargs[key] = kwargs[key]
+            status = mon(response, self.page.connection.session, **monitor_kwargs)
             if status:
                 response.json['status'] = status
                 if status in ('failed', 'error'):
@@ -79,6 +88,7 @@ class Launchable(object):
             'monitor': kwargs.pop('monitor', False),
             'wait': kwargs.pop('wait', False),
             'action_timeout': kwargs.pop('action_timeout', False),
+            'interval': kwargs.pop('interval', 5),
         }
         response = self.page.get().related.get(self.action).post(kwargs)
         self.monitor(response, **monitor_kwargs)
@@ -88,6 +98,68 @@ class Launchable(object):
 class JobTemplateLaunch(Launchable, CustomAction):
     action = 'launch'
     resource = 'job_templates'
+
+
+class BulkJobLaunch(Launchable, CustomAction):
+    action = 'job_launch'
+    resource = 'bulk'
+
+    @property
+    def options_endpoint(self):
+        return self.page.endpoint + '{}/'.format(self.action)
+
+    def add_arguments(self, parser, resource_options_parser):
+        Launchable.add_arguments(self, parser, resource_options_parser, with_pk=False)
+
+    def perform(self, **kwargs):
+        monitor_kwargs = {
+            'monitor': kwargs.pop('monitor', False),
+            'wait': kwargs.pop('wait', False),
+            'action_timeout': kwargs.pop('action_timeout', False),
+        }
+        response = self.page.get().job_launch.post(kwargs)
+        self.monitor(response, **monitor_kwargs)
+        return response
+
+
+class BulkHostCreate(CustomAction):
+    action = 'host_create'
+    resource = 'bulk'
+
+    @property
+    def options_endpoint(self):
+        return self.page.endpoint + '{}/'.format(self.action)
+
+    def add_arguments(self, parser, resource_options_parser):
+        options = self.page.connection.options(self.options_endpoint)
+        if options.ok:
+            options = options.json()['actions']['POST']
+            resource_options_parser.options['HOSTCREATEPOST'] = options
+            resource_options_parser.build_query_arguments(self.action, 'HOSTCREATEPOST')
+
+    def perform(self, **kwargs):
+        response = self.page.get().host_create.post(kwargs)
+        return response
+
+
+class BulkHostDelete(CustomAction):
+    action = 'host_delete'
+    resource = 'bulk'
+
+    @property
+    def options_endpoint(self):
+        return self.page.endpoint + '{}/'.format(self.action)
+
+    def add_arguments(self, parser, resource_options_parser):
+        options = self.page.connection.options(self.options_endpoint)
+        if options.ok:
+            options = options.json()['actions']['POST']
+            resource_options_parser.options['HOSTDELETEPOST'] = options
+            resource_options_parser.build_query_arguments(self.action, 'HOSTDELETEPOST')
+
+    def perform(self, **kwargs):
+        response = self.page.get().host_delete.post(kwargs)
+        return response
 
 
 class ProjectUpdate(Launchable, CustomAction):
@@ -148,7 +220,6 @@ class WorkflowLaunch(Launchable, CustomAction):
 
 
 class HasStdout(object):
-
     action = 'stdout'
 
     def add_arguments(self, parser, resource_options_parser):
@@ -180,7 +251,6 @@ class AdhocCommandStdout(HasStdout, CustomAction):
 
 
 class AssociationMixin(object):
-
     action = 'associate'
 
     def add_arguments(self, parser, resource_options_parser):
@@ -344,7 +414,6 @@ class SettingsList(CustomAction):
 
 
 class RoleMixin(object):
-
     has_roles = [
         ['organizations', 'organization'],
         ['projects', 'project'],
@@ -353,6 +422,7 @@ class RoleMixin(object):
         ['credentials', 'credential'],
         ['job_templates', 'job_template'],
         ['workflow_job_templates', 'workflow_job_template'],
+        ['instance_groups', 'instance_group'],
     ]
     roles = {}  # this is calculated once
 
@@ -408,7 +478,7 @@ class RoleMixin(object):
                     options = ', '.join(RoleMixin.roles[flag])
                     raise ValueError("invalid choice: '{}' must be one of {}".format(role, options))
                 value = kwargs[flag]
-                target = '/api/v2/{}/{}'.format(resource, value)
+                target = '{}v2/{}/{}'.format(config.api_base_path, resource, value)
                 detail = self.page.__class__(target, self.page.connection).get()
                 object_roles = detail['summary_fields']['object_roles']
                 actual_role = object_roles[role + '_role']
@@ -427,25 +497,21 @@ class RoleMixin(object):
 
 
 class UserGrant(RoleMixin, CustomAction):
-
     resource = 'users'
     action = 'grant'
 
 
 class UserRevoke(RoleMixin, CustomAction):
-
     resource = 'users'
     action = 'revoke'
 
 
 class TeamGrant(RoleMixin, CustomAction):
-
     resource = 'teams'
     action = 'grant'
 
 
 class TeamRevoke(RoleMixin, CustomAction):
-
     resource = 'teams'
     action = 'revoke'
 
@@ -476,7 +542,6 @@ class SettingsModify(CustomAction):
 
 
 class HasMonitor(object):
-
     action = 'monitor'
 
     def add_arguments(self, parser, resource_options_parser):

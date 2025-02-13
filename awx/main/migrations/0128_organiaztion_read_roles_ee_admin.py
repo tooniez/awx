@@ -6,7 +6,6 @@ import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('main', '0127_reset_pod_spec_override'),
     ]
@@ -18,7 +17,7 @@ class Migration(migrations.Migration):
             field=awx.main.fields.ImplicitRoleField(
                 editable=False,
                 null='True',
-                on_delete=django.db.models.deletion.CASCADE,
+                on_delete=django.db.models.deletion.SET_NULL,
                 parent_role=[
                     'member_role',
                     'auditor_role',

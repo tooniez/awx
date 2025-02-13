@@ -1,6 +1,9 @@
 import json
 
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
+
+from unittest import mock
 
 from awx.main.models import (
     Organization,
@@ -20,6 +23,7 @@ from awx.main.models import (
     WorkflowJobNode,
     WorkflowJobTemplateNode,
 )
+from awx.main.models.inventory import HostMetric, HostMetricSummaryMonthly
 
 # mk methods should create only a single object of a single type.
 # they should also have the option of being persisted or not.
@@ -95,11 +99,19 @@ def mk_user(name, is_superuser=False, organization=None, team=None, persisted=Tr
 
 def mk_project(name, organization=None, description=None, persisted=True):
     description = description or '{}-description'.format(name)
-    project = Project(name=name, description=description, playbook_files=['helloworld.yml', 'alt-helloworld.yml'])
+    project = Project(
+        name=name,
+        description=description,
+        playbook_files=['helloworld.yml', 'alt-helloworld.yml'],
+        scm_type='git',
+        scm_url='https://foo.invalid',
+        scm_revision='1234567890123456789012345678901234567890',
+        scm_update_on_launch=False,
+    )
     if organization is not None:
         project.organization = organization
     if persisted:
-        project.save()
+        project.save(skip_update=True)
     return project
 
 
@@ -248,3 +260,42 @@ def mk_workflow_job_node(unified_job_template=None, success_nodes=None, failure_
     if persisted:
         workflow_node.save()
     return workflow_node
+
+
+def mk_host_metric(hostname, first_automation, last_automation=None, last_deleted=None, deleted=False, persisted=True):
+    ok, idx = False, 1
+    while not ok:
+        try:
+            with mock.patch("django.utils.timezone.now") as mock_now:
+                mock_now.return_value = first_automation
+                metric = HostMetric(
+                    hostname=hostname or f"host-{first_automation}-{idx}",
+                    first_automation=first_automation,
+                    last_automation=last_automation or first_automation,
+                    last_deleted=last_deleted,
+                    deleted=deleted,
+                )
+                metric.validate_unique()
+                if persisted:
+                    metric.save()
+                ok = True
+        except ValidationError as e:
+            # Repeat create for auto-generated hostname
+            if not hostname and e.message_dict.get('hostname', None):
+                idx += 1
+            else:
+                raise e
+
+
+def mk_host_metric_summary(date, license_consumed=0, license_capacity=0, hosts_added=0, hosts_deleted=0, indirectly_managed_hosts=0, persisted=True):
+    summary = HostMetricSummaryMonthly(
+        date=date,
+        license_consumed=license_consumed,
+        license_capacity=license_capacity,
+        hosts_added=hosts_added,
+        hosts_deleted=hosts_deleted,
+        indirectly_managed_hosts=indirectly_managed_hosts,
+    )
+    if persisted:
+        summary.save()
+    return summary

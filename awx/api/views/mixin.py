@@ -15,8 +15,9 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from awx.main.constants import ACTIVE_STATES
+from awx.main.models import Organization
 from awx.main.utils import get_object_or_400
-from awx.main.models.ha import Instance, InstanceGroup
+from awx.main.models.ha import Instance, InstanceGroup, schedule_policy_task
 from awx.main.models.organization import Team
 from awx.main.models.projects import Project
 from awx.main.models.inventory import Inventory
@@ -50,7 +51,7 @@ class UnifiedJobDeletionMixin(object):
                 return Response({"error": _("Job has not finished processing events.")}, status=status.HTTP_400_BAD_REQUEST)
             else:
                 # if it has been > 1 minute, events are probably lost
-                logger.warning('Allowing deletion of {} through the API without all events ' 'processed.'.format(obj.log_format))
+                logger.warning('Allowing deletion of {} through the API without all events processed.'.format(obj.log_format))
 
         # Manually cascade delete events if unpartitioned job
         if obj.has_unpartitioned_events:
@@ -58,6 +59,21 @@ class UnifiedJobDeletionMixin(object):
 
         obj.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class OrganizationInstanceGroupMembershipMixin(object):
+    """
+    This mixin overloads attach/detach so that it calls Organization.save(),
+    to ensure instance group updates are persisted
+    """
+
+    def unattach(self, request, *args, **kwargs):
+        with transaction.atomic():
+            organization_queryset = Organization.objects.select_for_update()
+            organization = organization_queryset.get(pk=self.get_parent_object().id)
+            response = super(OrganizationInstanceGroupMembershipMixin, self).unattach(request, *args, **kwargs)
+            organization.save()
+            return response
 
 
 class InstanceGroupMembershipMixin(object):
@@ -107,6 +123,11 @@ class InstanceGroupMembershipMixin(object):
                 if inst_name in ig_obj.policy_instance_list:
                     ig_obj.policy_instance_list.pop(ig_obj.policy_instance_list.index(inst_name))
                     ig_obj.save(update_fields=['policy_instance_list'])
+
+            # sometimes removing an instance has a non-obvious consequence
+            # this is almost always true if policy_instance_percentage or _minimum is non-zero
+            # after removing a single instance, the other memberships need to be re-balanced
+            schedule_policy_task()
         return response
 
 

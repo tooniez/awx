@@ -5,9 +5,9 @@ import time
 from uuid import uuid4
 
 from django_guid import get_guid
+from django.conf import settings
 
 from . import pg_bus_conn
-from awx.main.utils import is_testing
 
 logger = logging.getLogger('awx.main.dispatch')
 
@@ -66,7 +66,6 @@ class task:
         bind_kwargs = self.bind_kwargs
 
         class PublisherMixin(object):
-
             queue = None
 
             @classmethod
@@ -74,15 +73,15 @@ class task:
                 return cls.apply_async(args, kwargs)
 
             @classmethod
-            def apply_async(cls, args=None, kwargs=None, queue=None, uuid=None, **kw):
+            def get_async_body(cls, args=None, kwargs=None, uuid=None, **kw):
+                """
+                Get the python dict to become JSON data in the pg_notify message
+                This same message gets passed over the dispatcher IPC queue to workers
+                If a task is submitted to a multiprocessing pool, skipping pg_notify, this might be used directly
+                """
                 task_id = uuid or str(uuid4())
                 args = args or []
                 kwargs = kwargs or {}
-                queue = queue or getattr(cls.queue, 'im_func', cls.queue)
-                if not queue:
-                    msg = f'{cls.name}: Queue value required and may not be None'
-                    logger.error(msg)
-                    raise ValueError(msg)
                 obj = {'uuid': task_id, 'args': args, 'kwargs': kwargs, 'task': cls.name, 'time_pub': time.time()}
                 guid = get_guid()
                 if guid:
@@ -90,9 +89,19 @@ class task:
                 if bind_kwargs:
                     obj['bind_kwargs'] = bind_kwargs
                 obj.update(**kw)
+                return obj
+
+            @classmethod
+            def apply_async(cls, args=None, kwargs=None, queue=None, uuid=None, **kw):
+                queue = queue or getattr(cls.queue, 'im_func', cls.queue)
+                if not queue:
+                    msg = f'{cls.name}: Queue value required and may not be None'
+                    logger.error(msg)
+                    raise ValueError(msg)
+                obj = cls.get_async_body(args=args, kwargs=kwargs, uuid=uuid, **kw)
                 if callable(queue):
                     queue = queue()
-                if not is_testing():
+                if not settings.DISPATCHER_MOCK_PUBLISH:
                     with pg_bus_conn() as conn:
                         conn.notify(queue, json.dumps(obj))
                 return (obj, queue)
@@ -117,4 +126,5 @@ class task:
         setattr(fn, 'name', cls.name)
         setattr(fn, 'apply_async', cls.apply_async)
         setattr(fn, 'delay', cls.delay)
+        setattr(fn, 'get_async_body', cls.get_async_body)
         return fn

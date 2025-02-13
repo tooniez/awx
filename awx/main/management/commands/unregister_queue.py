@@ -2,7 +2,8 @@
 # All Rights Reserved.
 import sys
 
-from awx.main.utils.pglock import advisory_lock
+from ansible_base.lib.utils.db import advisory_lock
+
 from awx.main.models import InstanceGroup
 
 from django.db import transaction
@@ -10,7 +11,6 @@ from django.core.management.base import BaseCommand, CommandError
 
 
 class Command(BaseCommand):
-
     help = (
         "Remove specified queue (instance group) from database.\n"
         "Instances inside of queue will continue to exist, \n"

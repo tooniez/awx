@@ -12,6 +12,8 @@ from unittest import mock
 
 from rest_framework.exceptions import ParseError
 
+from ansible_base.lib.utils.models import get_type_for_model
+
 from awx.main.utils import common
 from awx.api.validators import HostnameRegexValidator
 
@@ -106,7 +108,7 @@ TEST_MODELS = [
 # Cases relied on for scheduler dependent jobs list
 @pytest.mark.parametrize('model,name', TEST_MODELS)
 def test_get_type_for_model(model, name):
-    assert common.get_type_for_model(model) == name
+    assert get_type_for_model(model) == name
 
 
 def test_get_model_for_invalid_type():
@@ -117,6 +119,10 @@ def test_get_model_for_invalid_type():
 @pytest.mark.parametrize("model_type,model_class", [(name, cls) for cls, name in TEST_MODELS])
 def test_get_model_for_valid_type(model_type, model_class):
     assert common.get_model_for_type(model_type) == model_class
+
+
+def test_is_testing():
+    assert common.is_testing() is True
 
 
 @pytest.mark.parametrize("model_type,model_class", [(name, cls) for cls, name in TEST_MODELS])
@@ -186,7 +192,6 @@ def test_memoize_delete(memoized_function, mock_cache):
 
 
 def test_memoize_parameter_error():
-
     with pytest.raises(common.IllegalArgumentError):
 
         @common.memoize(cache_key='foo', track_function=True)
@@ -313,7 +318,7 @@ class TestHostnameRegexValidator:
 
     def test_good_call(self, regex_expr, re_flags):
         h = HostnameRegexValidator(regex=regex_expr, flags=re_flags)
-        assert (h("192.168.56.101"), None)
+        assert h("192.168.56.101") is None
 
     def test_bad_call(self, regex_expr, re_flags):
         h = HostnameRegexValidator(regex=regex_expr, flags=re_flags)
@@ -331,4 +336,4 @@ class TestHostnameRegexValidator:
 
     def test_bad_call_with_inverse(self, regex_expr, re_flags, inverse_match=True):
         h = HostnameRegexValidator(regex=regex_expr, flags=re_flags, inverse_match=inverse_match)
-        assert (h("@#$%)$#(TUFAS_DG"), None)
+        assert h("@#$%)$#(TUFAS_DG") is None

@@ -7,18 +7,16 @@ from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from django.utils.translation import gettext_lazy as _
 from django.utils.timezone import now
 
-# Django-Taggit
-from taggit.managers import TaggableManager
+# django-ansible-base
+from ansible_base.lib.utils.models import get_type_for_model
 
 # Django-CRUM
 from crum import get_current_user
 
 # AWX
 from awx.main.utils import encrypt_field, parse_yaml_or_json
-from awx.main.constants import CLOUD_PROVIDERS
 
 __all__ = [
-    'prevent_search',
     'VarsDictProperty',
     'BaseModel',
     'CreatedModifiedModel',
@@ -33,7 +31,6 @@ __all__ = [
     'JOB_TYPE_CHOICES',
     'AD_HOC_JOB_TYPE_CHOICES',
     'PROJECT_UPDATE_JOB_TYPE_CHOICES',
-    'CLOUD_INVENTORY_SOURCES',
     'VERBOSITY_CHOICES',
 ]
 
@@ -62,7 +59,6 @@ PROJECT_UPDATE_JOB_TYPE_CHOICES = [
     (PERM_INVENTORY_CHECK, _('Check')),
 ]
 
-CLOUD_INVENTORY_SOURCES = list(CLOUD_PROVIDERS) + ['scm']
 
 VERBOSITY_CHOICES = [
     (0, '0 (Normal)'),
@@ -142,6 +138,23 @@ class BaseModel(models.Model):
         if save and update_fields:
             self.save(update_fields=update_fields)
         return update_fields
+
+    def summary_fields(self):
+        """
+        This exists for use by django-ansible-base,
+        which has standard patterns that differ from AWX, but we enable views from DAB
+        for those views to list summary_fields for AWX models, those models need to provide this
+        """
+        from awx.api.serializers import SUMMARIZABLE_FK_FIELDS
+
+        model_name = get_type_for_model(self)
+        related_fields = SUMMARIZABLE_FK_FIELDS.get(model_name, {})
+        summary_data = {}
+        for field_name in related_fields:
+            fval = getattr(self, field_name, None)
+            if fval is not None:
+                summary_data[field_name] = fval
+        return summary_data
 
 
 class CreatedModifiedModel(BaseModel):
@@ -301,8 +314,6 @@ class PrimordialModel(HasEditsMixin, CreatedModifiedModel):
         on_delete=models.SET_NULL,
     )
 
-    tags = TaggableManager(blank=True)
-
     def __init__(self, *args, **kwargs):
         r = super(PrimordialModel, self).__init__(*args, **kwargs)
         if self.pk:
@@ -387,23 +398,6 @@ class NotificationFieldsModel(BaseModel):
     notification_templates_success = models.ManyToManyField("NotificationTemplate", blank=True, related_name='%(class)s_notification_templates_for_success')
 
     notification_templates_started = models.ManyToManyField("NotificationTemplate", blank=True, related_name='%(class)s_notification_templates_for_started')
-
-
-def prevent_search(relation):
-    """
-    Used to mark a model field or relation as "restricted from filtering"
-    e.g.,
-
-    class AuthToken(BaseModel):
-        user = prevent_search(models.ForeignKey(...))
-        sensitive_data = prevent_search(models.CharField(...))
-
-    The flag set by this function is used by
-    `awx.api.filters.FieldLookupBackend` to block fields and relations that
-    should not be searchable/filterable via search query params
-    """
-    setattr(relation, '__prevent_search__', True)
-    return relation
 
 
 def accepts_json(relation):

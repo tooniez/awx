@@ -5,8 +5,8 @@ from unittest import mock
 
 # AWX
 from awx.main.models import Host, Inventory, InventorySource, InventoryUpdate, CredentialType, Credential, Job
-from awx.main.constants import CLOUD_PROVIDERS
 from awx.main.utils.filters import SmartFilter
+from awx.main.utils.plugins import discover_available_cloud_provider_plugin_names
 
 
 @pytest.mark.django_db
@@ -166,10 +166,11 @@ class TestInventorySourceInjectors:
 
     def test_all_cloud_sources_covered(self):
         """Code in several places relies on the fact that the older
-        CLOUD_PROVIDERS constant contains the same names as what are
+        discover_cloud_provider_plugin_names returns the same names as what are
         defined within the injectors
         """
-        assert set(CLOUD_PROVIDERS) == set(InventorySource.injectors.keys())
+        # slight exception case for constructed, because it has a FQCN but is not a cloud source
+        assert set(discover_available_cloud_provider_plugin_names()) | set(['constructed']) == set(InventorySource.injectors.keys())
 
     @pytest.mark.parametrize('source,filename', [('ec2', 'aws_ec2.yml'), ('openstack', 'openstack.yml'), ('gce', 'gcp_compute.yml')])
     def test_plugin_filenames(self, source, filename):
@@ -192,6 +193,7 @@ class TestInventorySourceInjectors:
             ('satellite6', 'theforeman.foreman.foreman'),
             ('insights', 'redhatinsights.insights.insights'),
             ('controller', 'awx.awx.tower'),
+            ('terraform', 'cloud.terraform.terraform_state'),
         ],
     )
     def test_plugin_proper_names(self, source, proper_name):
@@ -230,7 +232,6 @@ def setup_ec2_gce(organization):
 
 @pytest.fixture
 def setup_inventory_groups(inventory, group_factory):
-
     groupA = group_factory('test_groupA')
     groupB = group_factory('test_groupB')
 
@@ -271,6 +272,7 @@ def test_inventory_update_excessively_long_name(inventory, inventory_source):
 class TestHostManager:
     def test_host_filter_not_smart(self, setup_ec2_gce, organization):
         smart_inventory = Inventory(name='smart', organization=organization, host_filter='inventory_sources__source=ec2')
+        smart_inventory.save()
         assert len(smart_inventory.hosts.all()) == 0
 
     def test_host_distinctness(self, setup_inventory_groups, organization):

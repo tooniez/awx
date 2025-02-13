@@ -65,16 +65,14 @@ class FixedSlidingWindow:
         return sum(self.buckets.values()) or 0
 
 
-class BroadcastWebsocketStatsManager:
-    def __init__(self, event_loop, local_hostname):
+class RelayWebsocketStatsManager:
+    def __init__(self, local_hostname):
         self._local_hostname = local_hostname
-
-        self._event_loop = event_loop
         self._stats = dict()
         self._redis_key = BROADCAST_WEBSOCKET_REDIS_KEY_NAME
 
     def new_remote_host_stats(self, remote_hostname):
-        self._stats[remote_hostname] = BroadcastWebsocketStats(self._local_hostname, remote_hostname)
+        self._stats[remote_hostname] = RelayWebsocketStats(self._local_hostname, remote_hostname)
         return self._stats[remote_hostname]
 
     def delete_remote_host_stats(self, remote_hostname):
@@ -94,7 +92,10 @@ class BroadcastWebsocketStatsManager:
             self.start()
 
     def start(self):
-        self.async_task = self._event_loop.create_task(self.run_loop())
+        self.async_task = asyncio.get_running_loop().create_task(
+            self.run_loop(),
+            name='RelayWebsocketStatsManager.run_loop',
+        )
         return self.async_task
 
     @classmethod
@@ -107,7 +108,7 @@ class BroadcastWebsocketStatsManager:
         return parser.text_string_to_metric_families(stats_str.decode('UTF-8'))
 
 
-class BroadcastWebsocketStats:
+class RelayWebsocketStats:
     def __init__(self, local_hostname, remote_hostname):
         self._local_hostname = local_hostname
         self._remote_hostname = remote_hostname

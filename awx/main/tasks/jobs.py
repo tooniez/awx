@@ -18,6 +18,9 @@ import urllib.parse as urlparse
 # Django
 from django.conf import settings
 
+# Shared code for the AWX platform
+from awx_plugins.interfaces._temporary_private_container_api import CONTAINER_ROOT, get_incontainer_path
+
 
 # Runner
 import ansible_runner
@@ -29,7 +32,7 @@ from gitdb.exc import BadName as BadGitName
 
 # AWX
 from awx.main.dispatch.publish import task
-from awx.main.dispatch import get_local_queuename
+from awx.main.dispatch import get_task_queuename
 from awx.main.constants import (
     PRIVILEGE_ESCALATION_METHODS,
     STANDARD_INVENTORY_UPDATE_ENV,
@@ -37,6 +40,7 @@ from awx.main.constants import (
     MAX_ISOLATED_PATH_COLON_DELIMITER,
     CONTAINER_VOLUMES_MOUNT_TYPES,
     ACTIVE_STATES,
+    HOST_FACTS_FIELDS,
 )
 from awx.main.models import (
     Instance,
@@ -63,15 +67,17 @@ from awx.main.tasks.callback import (
 )
 from awx.main.tasks.signals import with_signal_handling, signal_callback
 from awx.main.tasks.receptor import AWXReceptorJob
+from awx.main.tasks.facts import start_fact_cache, finish_fact_cache
 from awx.main.exceptions import AwxTaskError, PostRunError, ReceptorNodeNotFound
 from awx.main.utils.ansible import read_ansible_config
-from awx.main.utils.execution_environments import CONTAINER_ROOT, to_container_path
 from awx.main.utils.safe_yaml import safe_dump, sanitize_jinja
 from awx.main.utils.common import (
     update_scm_url,
     extract_ansible_vars,
     get_awx_version,
     create_partition,
+    ScheduleWorkflowManager,
+    ScheduleTaskManager,
 )
 from awx.conf.license import get_license
 from awx.main.utils.handlers import SpecialInventoryHandler
@@ -110,7 +116,7 @@ class BaseTask(object):
 
     def __init__(self):
         self.cleanup_paths = []
-        self.update_attempts = int(settings.DISPATCHER_DB_DOWNTOWN_TOLLERANCE / 5)
+        self.update_attempts = int(getattr(settings, 'DISPATCHER_DB_DOWNTOWN_TOLLERANCE', settings.DISPATCHER_DB_DOWNTIME_TOLERANCE) / 5)
         self.runner_callback = self.callback_class(model=self.model)
 
     def update_model(self, pk, _attempt=0, **updates):
@@ -288,13 +294,6 @@ class BaseTask(object):
             content = safe_dump(vars, safe_dict)
         return self.write_private_data_file(private_data_dir, 'extravars', content, sub_dir='env')
 
-    def add_awx_venv(self, env):
-        env['VIRTUAL_ENV'] = settings.AWX_VENV_PATH
-        if 'PATH' in env:
-            env['PATH'] = os.path.join(settings.AWX_VENV_PATH, "bin") + ":" + env['PATH']
-        else:
-            env['PATH'] = os.path.join(settings.AWX_VENV_PATH, "bin")
-
     def build_env(self, instance, private_data_dir, private_data_files=None):
         """
         Build environment dictionary for ansible-playbook.
@@ -302,7 +301,7 @@ class BaseTask(object):
         env = {}
         # Add ANSIBLE_* settings to the subprocess environment.
         for attr in dir(settings):
-            if attr == attr.upper() and attr.startswith('ANSIBLE_'):
+            if attr == attr.upper() and attr.startswith('ANSIBLE_') and not attr.startswith('ANSIBLE_BASE_'):
                 env[attr] = str(getattr(settings, attr))
         # Also set environment variables configured in AWX_TASK_ENV setting.
         for key, value in settings.AWX_TASK_ENV.items():
@@ -311,21 +310,26 @@ class BaseTask(object):
         env['AWX_PRIVATE_DATA_DIR'] = private_data_dir
 
         if self.instance.execution_environment is None:
-            raise RuntimeError('The project could not sync because there is no Execution Environment.')
+            raise RuntimeError(f'The {self.model.__name__} could not run because there is no Execution Environment.')
 
         return env
+
+    def write_inventory_file(self, inventory, private_data_dir, file_name, script_params):
+        script_data = inventory.get_script_data(**script_params)
+        for hostname, hv in script_data.get('_meta', {}).get('hostvars', {}).items():
+            # maintain a list of host_name --> host_id
+            # so we can associate emitted events to Host objects
+            self.runner_callback.host_map[hostname] = hv.get('remote_tower_id', '')
+        file_content = '#! /usr/bin/env python3\n# -*- coding: utf-8 -*-\nprint(%r)\n' % json.dumps(script_data)
+        return self.write_private_data_file(private_data_dir, file_name, file_content, sub_dir='inventory', file_permissions=0o700)
 
     def build_inventory(self, instance, private_data_dir):
         script_params = dict(hostvars=True, towervars=True)
         if hasattr(instance, 'job_slice_number'):
             script_params['slice_number'] = instance.job_slice_number
             script_params['slice_count'] = instance.job_slice_count
-        script_data = instance.inventory.get_script_data(**script_params)
-        # maintain a list of host_name --> host_id
-        # so we can associate emitted events to Host objects
-        self.runner_callback.host_map = {hostname: hv.pop('remote_tower_id', '') for hostname, hv in script_data.get('_meta', {}).get('hostvars', {}).items()}
-        file_content = '#! /usr/bin/env python3\n# -*- coding: utf-8 -*-\nprint(%r)\n' % json.dumps(script_data)
-        return self.write_private_data_file(private_data_dir, 'hosts', file_content, sub_dir='inventory', file_permissions=0o700)
+
+        return self.write_inventory_file(instance.inventory, private_data_dir, 'hosts', script_params)
 
     def build_args(self, instance, private_data_dir, passwords):
         raise NotImplementedError
@@ -390,6 +394,7 @@ class BaseTask(object):
             logger.error("I/O error({0}) while trying to open lock file [{1}]: {2}".format(e.errno, lock_path, e.strerror))
             raise
 
+        emitted_lockfile_log = False
         start_time = time.time()
         while True:
             try:
@@ -401,6 +406,9 @@ class BaseTask(object):
                     logger.error("I/O error({0}) while trying to aquire lock on file [{1}]: {2}".format(e.errno, lock_path, e.strerror))
                     raise
                 else:
+                    if not emitted_lockfile_log:
+                        logger.info(f"exception acquiring lock {lock_path}: {e}")
+                        emitted_lockfile_log = True
                     time.sleep(1.0)
             self.instance.refresh_from_db(fields=['cancel_flag'])
             if self.instance.cancel_flag or signal_callback():
@@ -445,6 +453,15 @@ class BaseTask(object):
                 ansible_version_info = ee_ansible_info.readline()
                 instance.ansible_version = ansible_version_info
                 instance.save(update_fields=['ansible_version'])
+
+        # Run task manager appropriately for speculative dependencies
+        if instance.unifiedjob_blocked_jobs.exists():
+            ScheduleTaskManager().schedule()
+        if instance.spawned_by_workflow:
+            ScheduleWorkflowManager().schedule()
+
+    def should_use_fact_cache(self):
+        return False
 
     @with_path_cleanup
     @with_signal_handling
@@ -544,7 +561,8 @@ class BaseTask(object):
                 params['module'] = self.build_module_name(self.instance)
                 params['module_args'] = self.build_module_args(self.instance)
 
-            if getattr(self.instance, 'use_fact_cache', False):
+            # TODO: refactor into a better BasTask method
+            if self.should_use_fact_cache():
                 # Enable Ansible fact cache.
                 params['fact_cache_type'] = 'jsonfile'
             else:
@@ -682,6 +700,7 @@ class SourceControlMixin(BaseTask):
             logger.debug(f'Project not available locally, {self.instance.id} will sync with remote')
             sync_needs.append(source_update_tag)
 
+        # Determine whether or not this project sync needs to populate the cache for Ansible content, roles and collections
         has_cache = os.path.exists(os.path.join(project.get_cache_path(), project.cache_id))
         # Galaxy requirements are not supported for manual projects
         if project.scm_type and ((not has_cache) or branch_override):
@@ -755,7 +774,7 @@ class SourceControlMixin(BaseTask):
 
     def sync_and_copy(self, project, private_data_dir, scm_branch=None):
         self.acquire_lock(project, self.instance.id)
-
+        is_commit = False
         try:
             original_branch = None
             failed_reason = project.get_reason_if_failed()
@@ -767,6 +786,7 @@ class SourceControlMixin(BaseTask):
                 if os.path.exists(project_path):
                     git_repo = git.Repo(project_path)
                     if git_repo.head.is_detached:
+                        is_commit = True
                         original_branch = git_repo.head.commit
                     else:
                         original_branch = git_repo.active_branch
@@ -778,7 +798,11 @@ class SourceControlMixin(BaseTask):
                 # for git project syncs, non-default branches can be problems
                 # restore to branch the repo was on before this run
                 try:
-                    original_branch.checkout()
+                    if is_commit:
+                        git_repo.head.set_commit(original_branch)
+                        git_repo.head.reset(index=True, working_tree=True)
+                    else:
+                        original_branch.checkout()
                 except Exception:
                     # this could have failed due to dirty tree, but difficult to predict all cases
                     logger.exception(f'Failed to restore project repo to prior state after {self.instance.id}')
@@ -786,7 +810,7 @@ class SourceControlMixin(BaseTask):
             self.release_lock(project)
 
 
-@task(queue=get_local_queuename)
+@task(queue=get_task_queuename)
 class RunJob(SourceControlMixin, BaseTask):
     """
     Run a job using ansible-playbook.
@@ -888,7 +912,7 @@ class RunJob(SourceControlMixin, BaseTask):
         cred_files = private_data_files.get('credentials', {})
         for cloud_cred in job.cloud_credentials:
             if cloud_cred and cloud_cred.credential_type.namespace == 'openstack' and cred_files.get(cloud_cred, ''):
-                env['OS_CLIENT_CONFIG_FILE'] = to_container_path(cred_files.get(cloud_cred, ''), private_data_dir)
+                env['OS_CLIENT_CONFIG_FILE'] = get_incontainer_path(cred_files.get(cloud_cred, ''), private_data_dir)
 
         for network_cred in job.network_credentials:
             env['ANSIBLE_NET_USERNAME'] = network_cred.get_input('username', default='')
@@ -906,6 +930,7 @@ class RunJob(SourceControlMixin, BaseTask):
         path_vars = (
             ('ANSIBLE_COLLECTIONS_PATHS', 'collections_paths', 'requirements_collections', '~/.ansible/collections:/usr/share/ansible/collections'),
             ('ANSIBLE_ROLES_PATH', 'roles_path', 'requirements_roles', '~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles'),
+            ('ANSIBLE_COLLECTIONS_PATH', 'collections_path', 'requirements_collections', '~/.ansible/collections:/usr/share/ansible/collections'),
         )
 
         config_values = read_ansible_config(os.path.join(private_data_dir, 'project'), list(map(lambda x: x[1], path_vars)))
@@ -994,6 +1019,9 @@ class RunJob(SourceControlMixin, BaseTask):
 
         return args
 
+    def should_use_fact_cache(self):
+        return self.instance.use_fact_cache
+
     def build_playbook_path_relative_to_cwd(self, job, private_data_dir):
         return job.playbook
 
@@ -1059,8 +1087,11 @@ class RunJob(SourceControlMixin, BaseTask):
 
         # Fetch "cached" fact data from prior runs and put on the disk
         # where ansible expects to find it
-        if job.use_fact_cache:
-            self.facts_write_time = self.instance.start_job_fact_cache(os.path.join(private_data_dir, 'artifacts', str(job.id), 'fact_cache'))
+        if self.should_use_fact_cache():
+            job.log_lifecycle("start_job_fact_cache")
+            self.facts_write_time = start_fact_cache(
+                job.get_hosts_for_fact_cache(), os.path.join(private_data_dir, 'artifacts', str(job.id), 'fact_cache'), inventory_id=job.inventory_id
+            )
 
     def build_project_dir(self, job, private_data_dir):
         self.sync_and_copy(job.project, private_data_dir, scm_branch=job.scm_branch)
@@ -1074,10 +1105,14 @@ class RunJob(SourceControlMixin, BaseTask):
             # actual `run()` call; this _usually_ means something failed in
             # the pre_run_hook method
             return
-        if job.use_fact_cache:
-            job.finish_job_fact_cache(
+        if self.should_use_fact_cache() and self.runner_callback.artifacts_processed:
+            job.log_lifecycle("finish_job_fact_cache")
+            finish_fact_cache(
+                job.get_hosts_for_fact_cache(),
                 os.path.join(private_data_dir, 'artifacts', str(job.id), 'fact_cache'),
-                self.facts_write_time,
+                facts_write_time=self.facts_write_time,
+                job_id=job.id,
+                inventory_id=job.inventory_id,
             )
 
     def final_run_hook(self, job, status, private_data_dir):
@@ -1091,9 +1126,8 @@ class RunJob(SourceControlMixin, BaseTask):
                 update_inventory_computed_fields.delay(inventory.id)
 
 
-@task(queue=get_local_queuename)
+@task(queue=get_task_queuename)
 class RunProjectUpdate(BaseTask):
-
     model = ProjectUpdate
     event_model = ProjectUpdateEvent
     callback_class = RunnerCallbackForProjectUpdate
@@ -1239,7 +1273,7 @@ class RunProjectUpdate(BaseTask):
 
         galaxy_creds_are_defined = project_update.project.organization and project_update.project.organization.galaxy_credentials.exists()
         if not galaxy_creds_are_defined and (settings.AWX_ROLES_ENABLED or settings.AWX_COLLECTIONS_ENABLED):
-            logger.warning('Galaxy role/collection syncing is enabled, but no ' f'credentials are configured for {project_update.project.organization}.')
+            logger.warning('Galaxy role/collection syncing is enabled, but no credentials are configured for {project_update.project.organization}.')
 
         extra_vars.update(
             {
@@ -1247,6 +1281,7 @@ class RunProjectUpdate(BaseTask):
                 'local_path': os.path.basename(project_update.project.local_path),
                 'project_path': project_update.get_project_path(check_if_exists=False),  # deprecated
                 'insights_url': settings.INSIGHTS_URL_BASE,
+                'oidc_endpoint': settings.INSIGHTS_OIDC_ENDPOINT,
                 'awx_license_type': get_license().get('license_type', 'UNLICENSED'),
                 'awx_version': get_awx_version(),
                 'scm_url': scm_url,
@@ -1413,10 +1448,14 @@ class RunProjectUpdate(BaseTask):
         )
         return params
 
+    def build_credentials_list(self, project_update):
+        if project_update.scm_type == 'insights' and project_update.credential:
+            return [project_update.credential]
+        return []
 
-@task(queue=get_local_queuename)
+
+@task(queue=get_task_queuename)
 class RunInventoryUpdate(SourceControlMixin, BaseTask):
-
     model = InventoryUpdate
     event_model = InventoryUpdateEvent
     callback_class = RunnerCallbackForInventoryUpdate
@@ -1462,8 +1501,6 @@ class RunInventoryUpdate(SourceControlMixin, BaseTask):
 
         if injector is not None:
             env = injector.build_env(inventory_update, env, private_data_dir, private_data_files)
-            # All CLOUD_PROVIDERS sources implement as inventory plugin from collection
-            env['ANSIBLE_INVENTORY_ENABLED'] = 'auto'
 
         if inventory_update.source == 'scm':
             for env_k in inventory_update.source_vars_dict:
@@ -1516,6 +1553,22 @@ class RunInventoryUpdate(SourceControlMixin, BaseTask):
 
         args = ['ansible-inventory', '--list', '--export']
 
+        # special case for constructed inventories, we pass source inventories from database
+        # these must come in order, and in order _before_ the constructed inventory itself
+        if inventory_update.inventory.kind == 'constructed':
+            inventory_update.log_lifecycle("start_job_fact_cache")
+            for input_inventory in inventory_update.inventory.input_inventories.all():
+                args.append('-i')
+                script_params = dict(hostvars=True, towervars=True)
+                source_inv_path = self.write_inventory_file(input_inventory, private_data_dir, f'hosts_{input_inventory.id}', script_params)
+                args.append(get_incontainer_path(source_inv_path, private_data_dir))
+                # Include any facts from input inventories so they can be used in filters
+                start_fact_cache(
+                    input_inventory.hosts.only(*HOST_FACTS_FIELDS),
+                    os.path.join(private_data_dir, 'artifacts', str(inventory_update.id), 'fact_cache'),
+                    inventory_id=input_inventory.id,
+                )
+
         # Add arguments for the source inventory file/script/thing
         rel_path = self.pseudo_build_inventory(inventory_update, private_data_dir)
         container_location = os.path.join(CONTAINER_ROOT, rel_path)
@@ -1523,6 +1576,11 @@ class RunInventoryUpdate(SourceControlMixin, BaseTask):
 
         args.append('-i')
         args.append(container_location)
+        # Added this in order to allow older versions of ansible-inventory https://github.com/ansible/ansible/pull/79596
+        # limit should be usable in ansible-inventory 2.15+
+        if inventory_update.limit:
+            args.append('--limit')
+            args.append(inventory_update.limit)
 
         args.append('--output')
         args.append(os.path.join(CONTAINER_ROOT, 'artifacts', str(inventory_update.id), 'output.json'))
@@ -1537,6 +1595,9 @@ class RunInventoryUpdate(SourceControlMixin, BaseTask):
             args.append('-' + 'v' * min(5, inventory_update.verbosity * 2 + 1))
 
         return args
+
+    def should_use_fact_cache(self):
+        return bool(self.instance.source == 'constructed')
 
     def build_inventory(self, inventory_update, private_data_dir):
         return None  # what runner expects in order to not deal with inventory
@@ -1579,7 +1640,7 @@ class RunInventoryUpdate(SourceControlMixin, BaseTask):
         if inventory_update.source == 'scm':
             if not source_project:
                 raise RuntimeError('Could not find project to run SCM inventory update from.')
-            self.sync_and_copy(source_project, private_data_dir)
+            self.sync_and_copy(source_project, private_data_dir, scm_branch=inventory_update.inventory_source.scm_branch)
         else:
             # If source is not SCM make an empty project directory, content is built inside inventory folder
             super(RunInventoryUpdate, self).build_project_dir(inventory_update, private_data_dir)
@@ -1656,7 +1717,7 @@ class RunInventoryUpdate(SourceControlMixin, BaseTask):
             raise PostRunError('Error occured while saving inventory data, see traceback or server logs', status='error', tb=traceback.format_exc())
 
 
-@task(queue=get_local_queuename)
+@task(queue=get_task_queuename)
 class RunAdHocCommand(BaseTask):
     """
     Run an ad hoc command using ansible.
@@ -1809,9 +1870,8 @@ class RunAdHocCommand(BaseTask):
         return d
 
 
-@task(queue=get_local_queuename)
+@task(queue=get_task_queuename)
 class RunSystemJob(BaseTask):
-
     model = SystemJob
     event_model = SystemJobEvent
     callback_class = RunnerCallbackForSystemJob
@@ -1830,6 +1890,8 @@ class RunSystemJob(BaseTask):
             if system_job.job_type in ('cleanup_jobs', 'cleanup_activitystream'):
                 if 'days' in json_vars:
                     args.extend(['--days', str(json_vars.get('days', 60))])
+                if 'batch_size' in json_vars:
+                    args.extend(['--batch-size', str(json_vars['batch_size'])])
                 if 'dry_run' in json_vars and json_vars['dry_run']:
                     args.extend(['--dry-run'])
             if system_job.job_type == 'cleanup_jobs':

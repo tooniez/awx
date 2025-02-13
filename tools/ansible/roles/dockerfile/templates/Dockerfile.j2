@@ -4,8 +4,20 @@
 ### DO NOT EDIT
 ###
 
+{% if not headless|bool %}
+# UI_next build contaienr
+FROM quay.io/centos/centos:stream9 AS ui-builder
+USER root
+RUN dnf -y update && dnf install -y nodejs make git
+RUN npm install -g n && n 18
+
+COPY . /tmp/src/
+WORKDIR /tmp/src/
+RUN make ui
+{% endif %}
+
 # Build container
-FROM quay.io/centos/centos:stream9 as builder
+FROM quay.io/centos/centos:stream9 AS builder
 
 ENV LANG en_US.UTF-8
 ENV LANGUAGE en_US:en
@@ -15,10 +27,14 @@ ENV AWX_LOGGING_MODE stdout
 
 USER root
 
+# Import the gpg key for DNF to work
+RUN rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
 # Install build dependencies
 RUN dnf -y update && dnf install -y 'dnf-command(config-manager)' && \
     dnf config-manager --set-enabled crb && \
     dnf -y install \
+    iputils \
     gcc \
     gcc-c++ \
     git-core \
@@ -27,24 +43,22 @@ RUN dnf -y update && dnf install -y 'dnf-command(config-manager)' && \
     libffi-devel \
     libtool-ltdl-devel \
     make \
-{% if not headless|bool %}
-    nodejs \
-{% endif %}
     nss \
-    openldap-devel \
     patch \
     postgresql \
     postgresql-devel \
-    python3-devel \
-    python3-pip \
-    python3-psycopg2 \
-    python3-setuptools \
+    python3.11 \
+    "python3.11-devel" \
+    "python3.11-pip" \
+    "python3.11-setuptools" \
+    "python3.11-packaging" \
+    "python3.11-psycopg2" \
     swig \
     unzip \
     xmlsec1-devel \
     xmlsec1-openssl-devel
 
-RUN pip3 install virtualenv build
+RUN pip3.11 install -vv build
 
 {% if image_architecture == 'ppc64le'  %}
     RUN dnf -y update && dnf install -y wget && \
@@ -60,34 +74,37 @@ RUN mkdir /tmp/requirements
 ADD requirements/requirements.txt \
     requirements/requirements_tower_uninstall.txt \
     requirements/requirements_git.txt \
+    requirements/requirements_git.credentials.txt \
     /tmp/requirements/
 
+RUN git config --global credential.helper "store --file=/tmp/requirements/requirements_git.credentials.txt"
 RUN cd /tmp && make requirements_awx
 
 ARG VERSION
 ARG SETUPTOOLS_SCM_PRETEND_VERSION
-ARG HEADLESS
 
 {% if (build_dev|bool) or (kube_dev|bool) %}
 ADD requirements/requirements_dev.txt /tmp/requirements
 RUN cd /tmp && make requirements_awx_dev
 {% else %}
-# Use the distro provided npm to bootstrap our required version of node
-
-{% if not headless|bool %}
-RUN npm install -g n && n 16.13.1
-{% endif %}
 
 # Copy source into builder, build sdist, install it into awx venv
 COPY . /tmp/src/
 WORKDIR /tmp/src/
+
+{% if not headless|bool %}
+COPY --from=ui-builder /tmp/src/awx/ui/build /tmp/src/awx/ui/build
+{% endif %}
+
 RUN make sdist && /var/lib/awx/venv/awx/bin/pip install dist/awx.tar.gz
 
 {% if not headless|bool %}
-RUN AWX_SETTINGS_FILE=/dev/null SKIP_SECRET_KEY_CHECK=yes SKIP_PG_VERSION_CHECK=yes /var/lib/awx/venv/awx/bin/awx-manage collectstatic --noinput --clear
+RUN DJANGO_SETTINGS_MODULE=awx.settings.defaults SKIP_SECRET_KEY_CHECK=yes SKIP_PG_VERSION_CHECK=yes /var/lib/awx/venv/awx/bin/awx-manage collectstatic --noinput --clear
 {% endif %}
 
 {% endif %}
+
+RUN rm /tmp/requirements/requirements_git.credentials.txt
 
 # Final container(s)
 FROM quay.io/centos/centos:stream9
@@ -99,6 +116,11 @@ ENV AWX_LOGGING_MODE stdout
 
 USER root
 
+# Import the gpg key for DNF to work
+RUN rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+ADD https://copr.fedorainfracloud.org/coprs/ansible/Rsyslog/repo/epel-9/ansible-Rsyslog-epel-9.repo /etc/yum.repos.d/ansible-Rsyslog-epel-9.repo
+
 # Install runtime requirements
 RUN dnf -y update && dnf install -y 'dnf-command(config-manager)' && \
     dnf config-manager --set-enabled crb && \
@@ -108,15 +130,15 @@ RUN dnf -y update && dnf install -y 'dnf-command(config-manager)' && \
     glibc-langpack-en \
     krb5-workstation \
     nginx \
-    "openldap >= 2.6.2-3" \
     postgresql \
-    python3-devel \
-    python3-libselinux \
-    python3-pip \
-    python3-psycopg2 \
-    python3-setuptools \
+    python3.11 \
+    "python3.11-devel" \
+    "python3.11-pip*" \
+    "python3.11-setuptools" \
+    "python3.11-packaging" \
+    "python3.11-psycopg2" \
     rsync \
-    "rsyslog >= 8.1911.0" \
+    rsyslog-8.2102.0-106.el9 \
     subversion \
     sudo \
     vim-minimal \
@@ -125,7 +147,7 @@ RUN dnf -y update && dnf install -y 'dnf-command(config-manager)' && \
     xmlsec1-openssl && \
     dnf -y clean all
 
-RUN pip3 install virtualenv supervisor dumb-init
+RUN pip3.11 install -vv virtualenv supervisor dumb-init build
 
 RUN rm -rf /root/.cache && rm -rf /tmp/*
 
@@ -157,7 +179,8 @@ RUN dnf -y install \
     unzip && \
     npm install -g n && n 16.13.1 && npm install -g npm@8.5.0 && dnf remove -y nodejs
 
-RUN pip3 install black git+https://github.com/coderanger/supervisor-stdout setuptools-scm
+RUN pip3.11 install -vv git+https://github.com/coderanger/supervisor-stdout.git@973ba19967cdaf46d9c1634d1675fc65b9574f6e
+RUN pip3.11 install -vv black setuptools-scm build
 
 # This package randomly fails to download.
 # It is nice to have in the dev env, but not necessary.
@@ -172,7 +195,7 @@ COPY --from=builder /var/lib/awx /var/lib/awx
 
 RUN ln -s /var/lib/awx/venv/awx/bin/awx-manage /usr/bin/awx-manage
 
-{%if build_dev|bool %}
+{% if build_dev|bool %}
 COPY --from={{ receptor_image }} /usr/bin/receptor /usr/bin/receptor
 
 RUN openssl req -nodes -newkey rsa:2048 -keyout /etc/nginx/nginx.key -out /etc/nginx/nginx.csr \
@@ -194,33 +217,43 @@ ENV _CONTAINERS_USERNS_CONFIGURED=""
 RUN mkdir -p /etc/containers/registries.conf.d/ && echo "unqualified-search-registries = []" >> /etc/containers/registries.conf.d/force-fully-qualified-images.conf && chmod 644 /etc/containers/registries.conf.d/force-fully-qualified-images.conf
 {% endif %}
 
-# Create default awx rsyslog config
 ADD tools/ansible/roles/dockerfile/files/rsyslog.conf /var/lib/awx/rsyslog/rsyslog.conf
 ADD tools/ansible/roles/dockerfile/files/wait-for-migrations /usr/local/bin/wait-for-migrations
 ADD tools/ansible/roles/dockerfile/files/stop-supervisor /usr/local/bin/stop-supervisor
 
+ADD tools/ansible/roles/dockerfile/files/uwsgi.ini /etc/tower/uwsgi.ini
+
 ## File mappings
 {% if build_dev|bool %}
 ADD tools/docker-compose/launch_awx.sh /usr/bin/launch_awx.sh
-ADD tools/docker-compose/nginx.conf /etc/nginx/nginx.conf
-ADD tools/docker-compose/nginx.vh.default.conf /etc/nginx/conf.d/nginx.vh.default.conf
 ADD tools/docker-compose/start_tests.sh /start_tests.sh
 ADD tools/docker-compose/bootstrap_development.sh /usr/bin/bootstrap_development.sh
 ADD tools/docker-compose/entrypoint.sh /entrypoint.sh
 ADD tools/scripts/config-watcher /usr/bin/config-watcher
-ADD https://raw.githubusercontent.com/containers/libpod/master/contrib/podmanimage/stable/containers.conf /etc/containers/containers.conf
-ADD https://raw.githubusercontent.com/containers/libpod/master/contrib/podmanimage/stable/podman-containers.conf /var/lib/awx/.config/containers/containers.conf
+{% elif kube_dev|bool %}
+RUN ln -sf /awx_devel/tools/ansible/roles/dockerfile/files/launch_awx_web.sh /usr/bin/launch_awx_web.sh
+RUN ln -sf /awx_devel/tools/ansible/roles/dockerfile/files/launch_awx_task.sh /usr/bin/launch_awx_task.sh
+RUN ln -sf /awx_devel/tools/ansible/roles/dockerfile/files/launch_awx_rsyslog.sh /usr/bin/launch_awx_rsyslog.sh
+RUN ln -sf /awx_devel/{{ template_dest }}/supervisor_web.conf /etc/supervisord_web.conf
+RUN ln -sf /awx_devel/{{ template_dest }}/supervisor_task.conf /etc/supervisord_task.conf
+RUN ln -sf /awx_devel/{{ template_dest }}/supervisor_rsyslog.conf /etc/supervisord_rsyslog.conf
 {% else %}
-ADD tools/ansible/roles/dockerfile/files/launch_awx.sh /usr/bin/launch_awx.sh
+ADD tools/ansible/roles/dockerfile/files/launch_awx_web.sh /usr/bin/launch_awx_web.sh
 ADD tools/ansible/roles/dockerfile/files/launch_awx_task.sh /usr/bin/launch_awx_task.sh
-ADD tools/ansible/roles/dockerfile/files/uwsgi.ini /etc/tower/uwsgi.ini
-ADD {{ template_dest }}/supervisor.conf /etc/supervisord.conf
+ADD tools/ansible/roles/dockerfile/files/launch_awx_rsyslog.sh /usr/bin/launch_awx_rsyslog.sh
+ADD tools/scripts/rsyslog-4xx-recovery /usr/bin/rsyslog-4xx-recovery
+ADD {{ template_dest }}/supervisor_web.conf /etc/supervisord_web.conf
 ADD {{ template_dest }}/supervisor_task.conf /etc/supervisord_task.conf
-{% endif %}
-{% if (build_dev|bool) or (kube_dev|bool) %}
-ADD tools/docker-compose/awx.egg-link /tmp/awx.egg-link
-ADD tools/docker-compose/awx-manage /usr/local/bin/awx-manage
+ADD {{ template_dest }}/supervisor_rsyslog.conf /etc/supervisord_rsyslog.conf
 ADD tools/scripts/awx-python /usr/bin/awx-python
+{% endif %}
+
+{% if (build_dev|bool) or (kube_dev|bool) %}
+RUN echo /awx_devel > /var/lib/awx/venv/awx/lib/python3.11/site-packages/awx.egg-link
+RUN echo /awx_devel > /var/lib/awx/venv/awx/lib/python3.11/site-packages/awx.pth
+RUN ln -sf /awx_devel/tools/docker-compose/awx-manage /usr/local/bin/awx-manage
+RUN ln -sf /awx_devel/tools/scripts/awx-python /usr/bin/awx-python
+RUN ln -sf /awx_devel/tools/scripts/rsyslog-4xx-recovery /usr/bin/rsyslog-4xx-recovery
 {% endif %}
 
 # Pre-create things we need to access
@@ -231,7 +264,7 @@ RUN for dir in \
       /var/lib/awx/.local/share/containers/storage \
       /var/run/awx-rsyslog \
       /var/log/nginx \
-      /var/lib/postgresql \
+      /var/lib/pgsql \
       /var/run/supervisor \
       /var/run/awx-receptor \
       /var/lib/nginx ; \
@@ -246,14 +279,11 @@ RUN for dir in \
 
 {% if (build_dev|bool) or (kube_dev|bool) %}
 RUN for dir in \
-      /etc/containers \
-      /var/lib/awx/.config/containers \
-      /var/lib/awx/.config/cni \
       /var/lib/awx/.local \
       /var/lib/awx/venv \
       /var/lib/awx/venv/awx/bin \
-      /var/lib/awx/venv/awx/lib/python3.9 \
-      /var/lib/awx/venv/awx/lib/python3.9/site-packages \
+      /var/lib/awx/venv/awx/lib/python3.11 \
+      /var/lib/awx/venv/awx/lib/python3.11/site-packages \
       /var/lib/awx/projects \
       /var/lib/awx/rsyslog \
       /var/run/awx-rsyslog \
@@ -265,14 +295,11 @@ RUN for dir in \
       /var/lib/awx/vendor ; \
     do mkdir -m 0775 -p $dir ; chmod g+rwx $dir ; chgrp root $dir ; done && \
     for file in \
-      /etc/containers/containers.conf \
-      /var/lib/awx/.config/containers/containers.conf \
       /var/lib/shared/overlay-images/images.lock \
       /var/lib/shared/overlay-layers/layers.lock \
       /var/lib/shared/vfs-images/images.lock \
       /var/lib/shared/vfs-layers/layers.lock \
-      /var/run/nginx.pid \
-      /var/lib/awx/venv/awx/lib/python3.9/site-packages/awx.egg-link ; \
+      /var/run/nginx.pid; \
     do touch $file ; chmod g+rw $file ; done && \
     echo "\setenv PAGER 'less -SXF'" > /var/lib/awx/.psqlrc
 {% endif %}
@@ -283,7 +310,6 @@ RUN ln -sf /dev/stdout /var/log/nginx/access.log && \
 {% endif %}
 
 ENV HOME="/var/lib/awx"
-ENV PATH="/usr/pgsql-12/bin:${PATH}"
 
 {% if build_dev|bool %}
 ENV PATH="/var/lib/awx/venv/awx/bin/:${PATH}"
@@ -297,7 +323,6 @@ USER 1000
 EXPOSE 8052
 
 ENTRYPOINT ["dumb-init", "--"]
-CMD /usr/bin/launch_awx.sh
 VOLUME /var/lib/nginx
 VOLUME /var/lib/awx/.local/share/containers
 {% endif %}

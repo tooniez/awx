@@ -29,12 +29,12 @@ options:
       choices: [ 'run', 'check' ]
     execution_environment:
       description:
-        - Execution Environment to use for the ad hoc command.
+        - Execution Environment name, ID, or named URL to use for the ad hoc command.
       required: False
       type: str
     inventory:
       description:
-        - Inventory to use for the ad hoc command.
+        - Inventory name, ID, or named URL to use for the ad hoc command.
       required: True
       type: str
     limit:
@@ -43,7 +43,7 @@ options:
       type: str
     credential:
       description:
-        - Credential to use for ad hoc command.
+        - Credential name, ID, or named URL to use for ad hoc command.
       required: True
       type: str
     module_name:
@@ -55,7 +55,6 @@ options:
       description:
         - The arguments to pass to the module.
       type: str
-      default: ""
     forks:
       description:
         - The number of forks to use for this ad hoc execution.
@@ -96,6 +95,13 @@ extends_documentation_fragment: awx.awx.auth
 '''
 
 EXAMPLES = '''
+- name: Launch an Ad Hoc Command waiting for it to finish
+  ad_hoc_command:
+    inventory: Demo Inventory
+    credential: Demo Credential
+    module_name: command
+    module_args: echo I <3 Ansible
+    wait: true
 '''
 
 RETURN = '''
@@ -112,6 +118,7 @@ status:
 '''
 
 from ..module_utils.controller_api import ControllerAPIModule
+import json
 
 
 def main():
@@ -124,13 +131,13 @@ def main():
         module_name=dict(required=True),
         module_args=dict(),
         forks=dict(type='int'),
-        verbosity=dict(type='int', choices=['0', '1', '2', '3', '4', '5']),
+        verbosity=dict(type='int', choices=[0, 1, 2, 3, 4, 5]),
         extra_vars=dict(type='dict'),
         become_enabled=dict(type='bool'),
         diff_mode=dict(type='bool'),
         wait=dict(default=False, type='bool'),
         interval=dict(default=2.0, type='float'),
-        timeout=dict(default=None, type='int'),
+        timeout=dict(type='int'),
         execution_environment=dict(),
     )
 
@@ -146,6 +153,7 @@ def main():
     wait = module.params.get('wait')
     interval = module.params.get('interval')
     timeout = module.params.get('timeout')
+    execution_environment = module.params.get('execution_environment')
 
     # Create a datastructure to pass into our command launch
     post_data = {
@@ -154,11 +162,17 @@ def main():
     }
     for arg in ['job_type', 'limit', 'forks', 'verbosity', 'extra_vars', 'become_enabled', 'diff_mode']:
         if module.params.get(arg):
-            post_data[arg] = module.params.get(arg)
+            # extra_var can receive a dict or a string, if a dict covert it to a string
+            if arg == 'extra_vars' and not isinstance(module.params.get(arg), str):
+                post_data[arg] = json.dumps(module.params.get(arg))
+            else:
+                post_data[arg] = module.params.get(arg)
 
     # Attempt to look up the related items the user specified (these will fail the module if not found)
     post_data['inventory'] = module.resolve_name_to_id('inventories', inventory)
     post_data['credential'] = module.resolve_name_to_id('credentials', credential)
+    if execution_environment:
+        post_data['execution_environment'] = module.resolve_name_to_id('execution_environments', execution_environment)
 
     # Launch the ad hoc command
     results = module.post_endpoint('ad_hoc_commands', **{'data': post_data})

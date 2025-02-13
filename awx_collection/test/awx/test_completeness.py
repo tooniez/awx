@@ -16,11 +16,15 @@ import glob
 # Normally a read-only endpoint should not have a module (i.e. /api/v2/me) but sometimes we reuse a name
 # For example, we have a role module but /api/v2/roles is a read only endpoint.
 # This list indicates which read-only endpoints have associated modules with them.
-read_only_endpoints_with_modules = ['settings', 'role', 'project_update']
+read_only_endpoints_with_modules = ['settings', 'role', 'project_update', 'workflow_approval']
 
 # If a module should not be created for an endpoint and the endpoint is not read-only add it here
 # THINK HARD ABOUT DOING THIS
-no_module_for_endpoint = []
+no_module_for_endpoint = [
+    'application',  # Usage of OAuth tokens is deprecated
+    'constructed_inventory',  # This is a view for inventory with kind=constructed
+    'token',  # Usage of OAuth tokens is deprecated
+]
 
 # Some modules work on the related fields of an endpoint. These modules will not have an auto-associated endpoint
 no_endpoint_for_module = [
@@ -44,16 +48,21 @@ no_endpoint_for_module = [
     'subscriptions',  # Subscription deals with config/subscriptions
 ]
 
+# Add modules with endpoints that are not at /api/v2
+extra_endpoints = {
+    'bulk_job_launch': '/api/v2/bulk/job_launch/',
+    'bulk_host_create': '/api/v2/bulk/host_create/',
+    'bulk_host_delete': '/api/v2/bulk/host_delete/',
+}
+
 # Global module parameters we can ignore
-ignore_parameters = ['state', 'new_name', 'update_secrets', 'copy_from']
+ignore_parameters = ['state', 'new_name', 'update_secrets', 'copy_from', 'is_internal']
 
 # Some modules take additional parameters that do not appear in the API
 # Add the module name as the key with the value being the list of params to ignore
 no_api_parameter_ok = {
     # The wait is for whether or not to wait for a project update on change
     'project': ['wait', 'interval', 'update_project'],
-    # Existing_token and id are for working with an existing tokens
-    'token': ['existing_token', 'existing_token_id'],
     # /survey spec is now how we handle associations
     # We take an organization here to help with the lookups only
     'job_template': ['survey_spec', 'organization'],
@@ -73,6 +82,8 @@ no_api_parameter_ok = {
     'user': ['new_username', 'organization'],
     # workflow_approval parameters that do not apply when approving an approval node.
     'workflow_approval': ['action', 'interval', 'timeout', 'workflow_job_id'],
+    # bulk
+    'bulk_job_launch': ['interval', 'wait'],
 }
 
 # When this tool was created we were not feature complete. Adding something in here indicates a module
@@ -228,12 +239,16 @@ def test_completeness(collection_import, request, admin_user, job_template, exec
         user=admin_user,
         expect=None,
     )
+
+    for key, val in extra_endpoints.items():
+        endpoint_response.data[key] = val
+
     for endpoint in endpoint_response.data.keys():
         # Module names are singular and endpoints are plural so we need to convert to singular
         singular_endpoint = '{0}'.format(endpoint)
         if singular_endpoint.endswith('ies'):
             singular_endpoint = singular_endpoint[:-3]
-        if singular_endpoint != 'settings' and singular_endpoint.endswith('s'):
+        elif singular_endpoint != 'settings' and singular_endpoint.endswith('s'):
             singular_endpoint = singular_endpoint[:-1]
         module_name = '{0}'.format(singular_endpoint)
 

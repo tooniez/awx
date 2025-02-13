@@ -4,8 +4,9 @@
 from django.db import transaction
 from django.core.management.base import BaseCommand, CommandError
 
+from ansible_base.lib.utils.db import advisory_lock
+
 from awx.main.models import Instance
-from awx.main.utils.pglock import advisory_lock
 
 
 class Command(BaseCommand):
@@ -13,7 +14,7 @@ class Command(BaseCommand):
     Deprovision a cluster node
     """
 
-    help = 'Remove instance from the database. ' 'Specify `--hostname` to use this command.'
+    help = 'Remove instance from the database. Specify `--hostname` to use this command.'
 
     def add_arguments(self, parser):
         parser.add_argument('--hostname', dest='hostname', type=str, help='Hostname used during provisioning')

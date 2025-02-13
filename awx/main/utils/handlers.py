@@ -2,9 +2,11 @@
 # All Rights Reserved.
 
 # Python
+import base64
 import logging
 import sys
 import traceback
+import os
 from datetime import datetime
 
 # Django
@@ -15,9 +17,17 @@ from django.utils.encoding import force_str
 # AWX
 from awx.main.exceptions import PostRunError
 
+# OTEL
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter as OTLPGrpcLogExporter
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter as OTLPHttpLogExporter
+
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.resources import Resource
+
 
 class RSysLogHandler(logging.handlers.SysLogHandler):
-
     append_nul = False
 
     def _connect_unixsocket(self, address):
@@ -98,11 +108,13 @@ class SpecialInventoryHandler(logging.Handler):
         self.event_handler(dispatch_data)
 
 
-ColorHandler = logging.StreamHandler
-
 if settings.COLOR_LOGS is True:
     try:
         from logutils.colorize import ColorizingStreamHandler
+        import colorama
+
+        colorama.deinit()
+        colorama.init(wrap=False, convert=False, strip=False)
 
         class ColorHandler(ColorizingStreamHandler):
             def colorize(self, line, record):
@@ -130,3 +142,41 @@ if settings.COLOR_LOGS is True:
     except ImportError:
         # logutils is only used for colored logs in the dev environment
         pass
+else:
+    ColorHandler = logging.StreamHandler
+
+
+class OTLPHandler(LoggingHandler):
+    def __init__(self, endpoint=None, protocol='grpc', service_name=None, instance_id=None, auth=None, username=None, password=None):
+        if not endpoint:
+            raise ValueError("endpoint required")
+
+        if auth == 'basic' and (username is None or password is None):
+            raise ValueError("auth type basic requires username and passsword parameters")
+
+        self.endpoint = endpoint
+        self.service_name = service_name or (sys.argv[1] if len(sys.argv) > 1 else (sys.argv[0] or 'unknown_service'))
+        self.instance_id = instance_id or os.uname().nodename
+
+        logger_provider = LoggerProvider(
+            resource=Resource.create(
+                {
+                    "service.name": self.service_name,
+                    "service.instance.id": self.instance_id,
+                }
+            ),
+        )
+        set_logger_provider(logger_provider)
+
+        headers = {}
+        if auth == 'basic':
+            secret = f'{username}:{password}'
+            headers['Authorization'] = "Basic " + base64.b64encode(secret.encode()).decode()
+
+        if protocol == 'grpc':
+            otlp_exporter = OTLPGrpcLogExporter(endpoint=self.endpoint, insecure=True, headers=headers)
+        elif protocol == 'http':
+            otlp_exporter = OTLPHttpLogExporter(endpoint=self.endpoint, headers=headers)
+        logger_provider.add_log_record_processor(BatchLogRecordProcessor(otlp_exporter))
+
+        super().__init__(level=logging.NOTSET, logger_provider=logger_provider)

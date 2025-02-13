@@ -29,8 +29,9 @@ class RunnerCallback:
         self.safe_env = {}
         self.event_ct = 0
         self.model = model
-        self.update_attempts = int(settings.DISPATCHER_DB_DOWNTOWN_TOLLERANCE / 5)
+        self.update_attempts = int(getattr(settings, 'DISPATCHER_DB_DOWNTOWN_TOLLERANCE', settings.DISPATCHER_DB_DOWNTIME_TOLERANCE) / 5)
         self.wrapup_event_dispatched = False
+        self.artifacts_processed = False
         self.extra_update_fields = {}
 
     def update_model(self, pk, _attempt=0, **updates):
@@ -85,6 +86,8 @@ class RunnerCallback:
         # which generate job events from two 'streams':
         # ansible-inventory and the awx.main.commands.inventory_import
         # logger
+        if event_data.get('event') == 'keepalive':
+            return
 
         if event_data.get(self.event_data_key, None):
             if self.event_data_key != 'job_id':
@@ -92,17 +95,17 @@ class RunnerCallback:
         if self.parent_workflow_job_id:
             event_data['workflow_job_id'] = self.parent_workflow_job_id
         event_data['job_created'] = self.job_created
-        if self.host_map:
-            host = event_data.get('event_data', {}).get('host', '').strip()
-            if host:
-                event_data['host_name'] = host
-                if host in self.host_map:
-                    event_data['host_id'] = self.host_map[host]
-            else:
-                event_data['host_name'] = ''
-                event_data['host_id'] = ''
-            if event_data.get('event') == 'playbook_on_stats':
-                event_data['host_map'] = self.host_map
+
+        host = event_data.get('event_data', {}).get('host', '').strip()
+        if host:
+            event_data['host_name'] = host
+            if host in self.host_map:
+                event_data['host_id'] = self.host_map[host]
+        else:
+            event_data['host_name'] = ''
+            event_data['host_id'] = ''
+        if event_data.get('event') == 'playbook_on_stats':
+            event_data['host_map'] = self.host_map
 
         if isinstance(self, RunnerCallbackForProjectUpdate):
             # need a better way to have this check.
@@ -116,7 +119,7 @@ class RunnerCallback:
             # so it *should* have a negligible performance impact
             task = event_data.get('event_data', {}).get('task_action')
             try:
-                if task in ('git', 'svn'):
+                if task in ('git', 'svn', 'ansible.builtin.git', 'ansible.builtin.svn'):
                     event_data_json = json.dumps(event_data)
                     event_data_json = UriCleaner.remove_sensitive(event_data_json)
                     event_data = json.loads(event_data_json)
@@ -205,9 +208,13 @@ class RunnerCallback:
             # We opened a connection just for that save, close it here now
             connections.close_all()
         elif status_data['status'] == 'error':
-            result_traceback = status_data.get('result_traceback', None)
-            if result_traceback:
-                self.delay_update(result_traceback=result_traceback)
+            for field_name in ('result_traceback', 'job_explanation'):
+                field_value = status_data.get(field_name, None)
+                if field_value:
+                    self.delay_update(**{field_name: field_value})
+
+    def artifacts_handler(self, artifact_dir):
+        self.artifacts_processed = True
 
 
 class RunnerCallbackForProjectUpdate(RunnerCallback):
@@ -219,7 +226,7 @@ class RunnerCallbackForProjectUpdate(RunnerCallback):
     def event_handler(self, event_data):
         super_return_value = super(RunnerCallbackForProjectUpdate, self).event_handler(event_data)
         returned_data = event_data.get('event_data', {})
-        if returned_data.get('task_action', '') == 'set_fact':
+        if returned_data.get('task_action', '') in ('set_fact', 'ansible.builtin.set_fact'):
             returned_facts = returned_data.get('res', {}).get('ansible_facts', {})
             if 'scm_version' in returned_facts:
                 self.playbook_new_revision = returned_facts['scm_version']
@@ -244,5 +251,4 @@ class RunnerCallbackForAdHocCommand(RunnerCallback):
 
 
 class RunnerCallbackForSystemJob(RunnerCallback):
-
     pass

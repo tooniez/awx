@@ -16,10 +16,12 @@ from rest_framework.exceptions import PermissionDenied
 import requests
 
 from awx.conf.license import get_license
+
+from ansible_base.lib.utils.db import advisory_lock
+
 from awx.main.models import Job
 from awx.main.access import access_registry
 from awx.main.utils import get_awx_http_client_headers, set_environ, datetime_hook
-from awx.main.utils.pglock import advisory_lock
 
 __all__ = ['register', 'gather', 'ship']
 
@@ -52,7 +54,7 @@ def all_collectors():
     }
 
 
-def register(key, version, description=None, format='json', expensive=None):
+def register(key, version, description=None, format='json', expensive=None, full_sync_interval=None):
     """
     A decorator used to register a function as a metric collector.
 
@@ -71,6 +73,7 @@ def register(key, version, description=None, format='json', expensive=None):
         f.__awx_analytics_description__ = description
         f.__awx_analytics_type__ = format
         f.__awx_expensive__ = expensive
+        f.__awx_full_sync_interval__ = full_sync_interval
         return f
 
     return decorate
@@ -180,7 +183,10 @@ def gather(dest=None, module=None, subset=None, since=None, until=None, collecti
             logger.log(log_level, "Automation Analytics not enabled. Use --dry-run to gather locally without sending.")
             return None
 
-        if not (settings.AUTOMATION_ANALYTICS_URL and settings.REDHAT_USERNAME and settings.REDHAT_PASSWORD):
+        if not (
+            settings.AUTOMATION_ANALYTICS_URL
+            and ((settings.REDHAT_USERNAME and settings.REDHAT_PASSWORD) or (settings.SUBSCRIPTIONS_USERNAME and settings.SUBSCRIPTIONS_PASSWORD))
+        ):
             logger.log(log_level, "Not gathering analytics, configuration is invalid. Use --dry-run to gather locally without sending.")
             return None
 
@@ -259,10 +265,19 @@ def gather(dest=None, module=None, subset=None, since=None, until=None, collecti
                 # These slicer functions may return a generator. The `since` parameter is
                 # allowed to be None, and will fall back to LAST_ENTRIES[key] or to
                 # LAST_GATHER (truncated appropriately to match the 4-week limit).
+                #
+                # Or it can force full table sync if interval is given
+                kwargs = dict()
+                full_sync_enabled = False
+                if func.__awx_full_sync_interval__:
+                    last_full_sync = last_entries.get(f"{key}_full")
+                    full_sync_enabled = not last_full_sync or last_full_sync < now() - timedelta(days=func.__awx_full_sync_interval__)
+
+                kwargs['full_sync_enabled'] = full_sync_enabled
                 if func.__awx_expensive__:
-                    slices = func.__awx_expensive__(key, since, until, last_gather)
+                    slices = func.__awx_expensive__(key, since, until, last_gather, **kwargs)
                 else:
-                    slices = collectors.trivial_slicing(key, since, until, last_gather)
+                    slices = collectors.trivial_slicing(key, since, until, last_gather, **kwargs)
 
                 for start, end in slices:
                     files = func(start, full_path=gather_dir, until=end)
@@ -300,6 +315,12 @@ def gather(dest=None, module=None, subset=None, since=None, until=None, collecti
             except Exception:
                 succeeded = False
                 logger.exception("Could not generate metric {}".format(filename))
+
+            # update full sync timestamp if successfully shipped
+            if full_sync_enabled and collection_type != 'dry-run' and succeeded:
+                with disable_activity_stream():
+                    last_entries[f"{key}_full"] = now()
+                    settings.AUTOMATION_ANALYTICS_LAST_ENTRIES = json.dumps(last_entries, cls=DjangoJSONEncoder)
 
         if collection_type != 'dry-run':
             if succeeded:
@@ -345,23 +366,29 @@ def ship(path):
     if not url:
         logger.error('AUTOMATION_ANALYTICS_URL is not set')
         return False
+
     rh_user = getattr(settings, 'REDHAT_USERNAME', None)
     rh_password = getattr(settings, 'REDHAT_PASSWORD', None)
+
+    if not rh_user or not rh_password:
+        logger.info('REDHAT_USERNAME and REDHAT_PASSWORD are not set, using SUBSCRIPTIONS_USERNAME and SUBSCRIPTIONS_PASSWORD')
+        rh_user = getattr(settings, 'SUBSCRIPTIONS_USERNAME', None)
+        rh_password = getattr(settings, 'SUBSCRIPTIONS_PASSWORD', None)
+
     if not rh_user:
-        logger.error('REDHAT_USERNAME is not set')
+        logger.error('REDHAT_USERNAME and SUBSCRIPTIONS_USERNAME are not set')
         return False
     if not rh_password:
-        logger.error('REDHAT_PASSWORD is not set')
+        logger.error('REDHAT_PASSWORD and SUBSCRIPTIONS_USERNAME are not set')
         return False
+
     with open(path, 'rb') as f:
         files = {'file': (os.path.basename(path), f, settings.INSIGHTS_AGENT_MIME)}
         s = requests.Session()
         s.headers = get_awx_http_client_headers()
         s.headers.pop('Content-Type')
         with set_environ(**settings.AWX_TASK_ENV):
-            response = s.post(
-                url, files=files, verify="/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", auth=(rh_user, rh_password), headers=s.headers, timeout=(31, 31)
-            )
+            response = s.post(url, files=files, verify=settings.INSIGHTS_CERT_PATH, auth=(rh_user, rh_password), headers=s.headers, timeout=(31, 31))
         # Accept 2XX status_codes
         if response.status_code >= 300:
             logger.error('Upload failed with status {}, {}'.format(response.status_code, response.text))

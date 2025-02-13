@@ -4,21 +4,30 @@ __metaclass__ = type
 
 from ansible.module_utils.basic import AnsibleModule, env_fallback
 from ansible.module_utils.urls import Request, SSLValidationError, ConnectionError
+from ansible.module_utils.parsing.convert_bool import boolean as strtobool
 from ansible.module_utils.six import PY2
-from ansible.module_utils.six import raise_from, string_types
+from ansible.module_utils.six import raise_from
 from ansible.module_utils.six.moves import StringIO
 from ansible.module_utils.six.moves.urllib.error import HTTPError
 from ansible.module_utils.six.moves.http_cookiejar import CookieJar
-from ansible.module_utils.six.moves.urllib.parse import urlparse, urlencode
+from ansible.module_utils.six.moves.urllib.parse import urlparse, urlencode, quote
 from ansible.module_utils.six.moves.configparser import ConfigParser, NoOptionError
-from distutils.version import LooseVersion as Version
+from base64 import b64encode
 from socket import getaddrinfo, IPPROTO_TCP
 import time
 import re
 from json import loads, dumps
 from os.path import isfile, expanduser, split, join, exists, isdir
-from os import access, R_OK, getcwd
-from distutils.util import strtobool
+from os import access, R_OK, getcwd, environ, getenv
+
+
+try:
+    from ansible.module_utils.compat.version import LooseVersion as Version
+except ImportError:
+    try:
+        from distutils.version import LooseVersion as Version
+    except ImportError:
+        raise AssertionError('To use this plugin or module with ansible-core 2.11, you need to use Python < 3.12 with distutils.version present')
 
 try:
     import yaml
@@ -26,6 +35,8 @@ try:
     HAS_YAML = True
 except ImportError:
     HAS_YAML = False
+
+CONTROLLER_BASE_PATH_ENV_VAR = "CONTROLLER_OPTIONAL_API_URLPATTERN_PREFIX"
 
 
 class ConfigFileException(Exception):
@@ -39,54 +50,36 @@ class ItemNotDefined(Exception):
 class ControllerModule(AnsibleModule):
     url = None
     AUTH_ARGSPEC = dict(
-        controller_host=dict(
-            required=False,
-            aliases=['tower_host'],
-            fallback=(env_fallback, ['CONTROLLER_HOST', 'TOWER_HOST'])),
-        controller_username=dict(
-            required=False,
-            aliases=['tower_username'],
-            fallback=(env_fallback, ['CONTROLLER_USERNAME', 'TOWER_USERNAME'])),
-        controller_password=dict(
-            no_log=True,
-            aliases=['tower_password'],
-            required=False,
-            fallback=(env_fallback, ['CONTROLLER_PASSWORD', 'TOWER_PASSWORD'])),
-        validate_certs=dict(
-            type='bool',
-            aliases=['tower_verify_ssl'],
-            required=False,
-            fallback=(env_fallback, ['CONTROLLER_VERIFY_SSL', 'TOWER_VERIFY_SSL'])),
-        controller_oauthtoken=dict(
-            type='raw',
-            no_log=True,
-            aliases=['tower_oauthtoken'],
-            required=False,
-            fallback=(env_fallback, ['CONTROLLER_OAUTH_TOKEN', 'TOWER_OAUTH_TOKEN'])),
-        controller_config_file=dict(
-            type='path',
-            aliases=['tower_config_file'],
-            required=False,
-            default=None),
+        controller_host=dict(required=False, aliases=['tower_host'], fallback=(env_fallback, ['CONTROLLER_HOST', 'TOWER_HOST'])),
+        controller_username=dict(required=False, aliases=['tower_username'], fallback=(env_fallback, ['CONTROLLER_USERNAME', 'TOWER_USERNAME'])),
+        controller_password=dict(no_log=True, aliases=['tower_password'], required=False, fallback=(env_fallback, ['CONTROLLER_PASSWORD', 'TOWER_PASSWORD'])),
+        validate_certs=dict(type='bool', aliases=['tower_verify_ssl'], required=False, fallback=(env_fallback, ['CONTROLLER_VERIFY_SSL', 'TOWER_VERIFY_SSL'])),
+        request_timeout=dict(type='float', required=False, fallback=(env_fallback, ['CONTROLLER_REQUEST_TIMEOUT'])),
+        controller_config_file=dict(type='path', aliases=['tower_config_file'], required=False, default=None),
     )
+    # Associations of these types are ordered and have special consideration in the modified associations function
+    ordered_associations = ['instance_groups', 'galaxy_credentials', 'input_inventories']
     short_params = {
         'host': 'controller_host',
         'username': 'controller_username',
         'password': 'controller_password',
         'verify_ssl': 'validate_certs',
-        'oauth_token': 'controller_oauthtoken',
+        'request_timeout': 'request_timeout',
     }
     host = '127.0.0.1'
     username = None
     password = None
     verify_ssl = True
-    oauth_token = None
-    oauth_token_id = None
+    request_timeout = 10
     authenticated = False
     config_name = 'tower_cli.cfg'
     version_checked = False
     error_callback = None
     warn_callback = None
+    apps_api_versions = {
+        "awx": "v2",
+        "gateway": "v1",
+    }
 
     def __init__(self, argument_spec=None, direct_params=None, error_callback=None, warn_callback=None, **kwargs):
         full_argspec = {}
@@ -112,20 +105,6 @@ class ControllerModule(AnsibleModule):
             if direct_value is not None:
                 setattr(self, short_param, direct_value)
 
-        # Perform magic depending on whether controller_oauthtoken is a string or a dict
-        if self.params.get('controller_oauthtoken'):
-            token_param = self.params.get('controller_oauthtoken')
-            if type(token_param) is dict:
-                if 'token' in token_param:
-                    self.oauth_token = self.params.get('controller_oauthtoken')['token']
-                else:
-                    self.fail_json(msg="The provided dict in controller_oauthtoken did not properly contain the token entry")
-            elif isinstance(token_param, string_types):
-                self.oauth_token = self.params.get('controller_oauthtoken')
-            else:
-                error_msg = "The provided controller_oauthtoken type was not valid ({0}). Valid options are str or dict.".format(type(token_param).__name__)
-                self.fail_json(msg=error_msg)
-
         # Perform some basic validation
         if not re.match('^https{0,1}://', self.host):
             self.host = "https://{0}".format(self.host)
@@ -144,19 +123,23 @@ class ControllerModule(AnsibleModule):
             self.url.hostname.replace(char, "")
         # Try to resolve the hostname
         try:
-            addrinfolist = getaddrinfo(self.url.hostname, self.url.port, proto=IPPROTO_TCP)
-            for family, kind, proto, canonical, sockaddr in addrinfolist:
-                sockaddr[0]
+            proxy_env_var_name = "{0}_proxy".format(self.url.scheme)
+            if not environ.get(proxy_env_var_name) and not environ.get(proxy_env_var_name.upper()):
+                addrinfolist = getaddrinfo(self.url.hostname, self.url.port, proto=IPPROTO_TCP)
+                for family, kind, proto, canonical, sockaddr in addrinfolist:
+                    sockaddr[0]
         except Exception as e:
             self.fail_json(msg="Unable to resolve controller_host ({1}): {0}".format(self.url.hostname, e))
 
-    def build_url(self, endpoint, query_params=None):
+    def build_url(self, endpoint, query_params=None, app_key=None):
         # Make sure we start with /api/vX
         if not endpoint.startswith("/"):
             endpoint = "/{0}".format(endpoint)
-        prefix = self.url_prefix.rstrip("/")
-        if not endpoint.startswith(prefix + "/api/"):
-            endpoint = prefix + "/api/v2{0}".format(endpoint)
+        hostname_prefix = self.url_prefix.rstrip("/")
+        api_path = self.api_path(app_key=app_key)
+        api_version = self.apps_api_versions.get(app_key, self.apps_api_versions.get("awx", "v2"))
+        if not endpoint.startswith(hostname_prefix + api_path):
+            endpoint = hostname_prefix + f"{api_path}{api_version}{endpoint}"
         if not endpoint.endswith('/') and '?' not in endpoint:
             endpoint = "{0}/".format(endpoint)
 
@@ -221,7 +204,7 @@ class ControllerModule(AnsibleModule):
                 try:
                     config_data = yaml.load(config_string, Loader=yaml.SafeLoader)
                     # If this is an actual ini file, yaml will return the whole thing as a string instead of a dict
-                    if type(config_data) is not dict:
+                    if not isinstance(config_data, dict):
                         raise AssertionError("The yaml config file is not properly formatted as a dict.")
                     try_config_parsing = False
 
@@ -263,7 +246,7 @@ class ControllerModule(AnsibleModule):
             if honorred_setting in config_data:
                 # Veriffy SSL must be a boolean
                 if honorred_setting == 'verify_ssl':
-                    if type(config_data[honorred_setting]) is str:
+                    if isinstance(config_data[honorred_setting], str):
                         setattr(self, honorred_setting, strtobool(config_data[honorred_setting]))
                     else:
                         setattr(self, honorred_setting, bool(config_data[honorred_setting]))
@@ -312,20 +295,13 @@ class ControllerAPIModule(ControllerModule):
     def __init__(self, argument_spec, direct_params=None, error_callback=None, warn_callback=None, **kwargs):
         kwargs['supports_check_mode'] = True
 
-        super().__init__(
-            argument_spec=argument_spec, direct_params=direct_params, error_callback=error_callback, warn_callback=warn_callback, **kwargs
-        )
-        self.session = Request(cookies=CookieJar(), validate_certs=self.verify_ssl)
+        super().__init__(argument_spec=argument_spec, direct_params=direct_params, error_callback=error_callback, warn_callback=warn_callback, **kwargs)
+        self.session = Request(cookies=CookieJar(), timeout=self.request_timeout, validate_certs=self.verify_ssl)
 
         if 'update_secrets' in self.params:
             self.update_secrets = self.params.pop('update_secrets')
         else:
             self.update_secrets = True
-
-    @staticmethod
-    def param_to_endpoint(name):
-        exceptions = {'inventory': 'inventories', 'target_team': 'teams', 'workflow': 'workflow_job_templates'}
-        return exceptions.get(name, '{0}s'.format(name))
 
     @staticmethod
     def get_name_field_from_endpoint(endpoint):
@@ -339,8 +315,7 @@ class ControllerAPIModule(ControllerModule):
             for field_name in ControllerAPIModule.IDENTITY_FIELDS.values():
                 if field_name in item:
                     return item[field_name]
-
-            if item.get('type', None) in ('o_auth2_access_token', 'credential_input_source'):
+            if item.get('type', None) == 'credential_input_source':
                 return item['id']
 
         if allow_unknown:
@@ -397,31 +372,53 @@ class ControllerAPIModule(ControllerModule):
             response['json']['next'] = next_page
         return response
 
-    def get_one(self, endpoint, name_or_id=None, allow_none=True, **kwargs):
+    def get_one(self, endpoint, name_or_id=None, allow_none=True, check_exists=False, **kwargs):
         new_kwargs = kwargs.copy()
-        if name_or_id:
-            name_field = self.get_name_field_from_endpoint(endpoint)
-            new_data = kwargs.get('data', {}).copy()
-            if name_field in new_data:
-                self.fail_json(msg="You can't specify the field {0} in your search data if using the name_or_id field".format(name_field))
+        response = None
 
-            try:
-                new_data['or__id'] = int(name_or_id)
-                new_data['or__{0}'.format(name_field)] = name_or_id
-            except ValueError:
-                # If we get a value error, then we didn't have an integer so we can just pass and fall down to the fail
-                new_data[name_field] = name_or_id
-            new_kwargs['data'] = new_data
+        # A named URL is pretty unique so if we have a ++ in the name then lets start by looking for that
+        # This also needs to go first because if there was data passed in kwargs and we do the next lookup first there may be results
+        if name_or_id is not None and '++' in name_or_id:
+            # Maybe someone gave us a named URL so lets see if we get anything from that.
+            url_quoted_name = quote(name_or_id, safe="+")
+            named_endpoint = '{0}/{1}/'.format(endpoint, url_quoted_name)
+            named_response = self.get_endpoint(named_endpoint)
 
-        response = self.get_endpoint(endpoint, **new_kwargs)
-        if response['status_code'] != 200:
-            fail_msg = "Got a {0} response when trying to get one from {1}".format(response['status_code'], endpoint)
-            if 'detail' in response.get('json', {}):
-                fail_msg += ', detail: {0}'.format(response['json']['detail'])
-            self.fail_json(msg=fail_msg)
+            if named_response['status_code'] == 200 and 'json' in named_response:
+                # We found a named item but we expect to deal with a list view so mock that up
+                response = {
+                    'json': {
+                        'count': 1,
+                        'results': [named_response['json']],
+                    }
+                }
 
-        if 'count' not in response['json'] or 'results' not in response['json']:
-            self.fail_json(msg="The endpoint did not provide count and results")
+        # Since we didn't have a named URL, lets try and find it with a general search
+        if response is None:
+            if name_or_id:
+                name_field = self.get_name_field_from_endpoint(endpoint)
+                new_data = kwargs.get('data', {}).copy()
+                if name_field in new_data:
+                    self.fail_json(msg="You can't specify the field {0} in your search data if using the name_or_id field".format(name_field))
+
+                try:
+                    new_data['or__id'] = int(name_or_id)
+                    new_data['or__{0}'.format(name_field)] = name_or_id
+                except ValueError:
+                    # If we get a value error, then we didn't have an integer so we can just pass and fall down to the fail
+                    new_data[name_field] = name_or_id
+                new_kwargs['data'] = new_data
+
+            response = self.get_endpoint(endpoint, **new_kwargs)
+
+            if response['status_code'] != 200:
+                fail_msg = "Got a {0} response when trying to get one from {1}".format(response['status_code'], endpoint)
+                if 'detail' in response.get('json', {}):
+                    fail_msg += ', detail: {0}'.format(response['json']['detail'])
+                self.fail_json(msg=fail_msg)
+
+            if 'count' not in response['json'] or 'results' not in response['json']:
+                self.fail_json(msg="The endpoint did not provide count and results")
 
         if response['json']['count'] == 0:
             if allow_none:
@@ -438,6 +435,10 @@ class ControllerAPIModule(ControllerModule):
             # Or we weren't running with a or search and just got back too many to begin with.
             self.fail_wanted_one(response, endpoint, new_kwargs.get('data'))
 
+        if check_exists:
+            self.json_output['id'] = response['json']['results'][0]['id']
+            self.exit_json(**self.json_output)
+
         return response['json']['results'][0]
 
     def fail_wanted_one(self, response, endpoint, query_params):
@@ -445,7 +446,8 @@ class ControllerAPIModule(ControllerModule):
         if len(sample['json']['results']) > 1:
             sample['json']['results'] = sample['json']['results'][:2] + ['...more results snipped...']
         url = self.build_url(endpoint, query_params)
-        display_endpoint = url.geturl()[len(self.host):]  # truncate to not include the base URL
+        host_length = len(self.host)
+        display_endpoint = url.geturl()[host_length:]  # truncate to not include the base URL
         self.fail_json(
             msg="Request to {0} returned {1} items, expected 1".format(display_endpoint, response['json']['count']),
             query=query_params,
@@ -472,13 +474,12 @@ class ControllerAPIModule(ControllerModule):
         # Extract the headers, this will be used in a couple of places
         headers = kwargs.get('headers', {})
 
-        # Authenticate to AWX (if we don't have a token and if not already done so)
-        if not self.oauth_token and not self.authenticated:
-            # This method will set a cookie in the cookie jar for us and also an oauth_token
+        # Authenticate to AWX (if not already done so)
+        if not self.authenticated:
+            # This method will set a cookie in the cookie jar for us
             self.authenticate(**kwargs)
-        if self.oauth_token:
-            # If we have a oauth token, we just use a bearer header
-            headers['Authorization'] = 'Bearer {0}'.format(self.oauth_token)
+
+        headers['Authorization'] = self._get_basic_authorization_header()
 
         if method in ['POST', 'PUT', 'PATCH']:
             headers.setdefault('Content-Type', 'application/json')
@@ -489,7 +490,14 @@ class ControllerAPIModule(ControllerModule):
             data = dumps(kwargs.get('data', {}))
 
         try:
-            response = self.session.open(method, url.geturl(), headers=headers, validate_certs=self.verify_ssl, follow_redirects=True, data=data)
+            response = self.session.open(
+                method, url.geturl(),
+                headers=headers,
+                timeout=self.request_timeout,
+                validate_certs=self.verify_ssl,
+                follow_redirects=True,
+                data=data
+            )
         except (SSLValidationError) as ssl_err:
             self.fail_json(msg="Could not establish a secure connection to your host ({1}): {0}.".format(url.netloc, ssl_err))
         except (ConnectionError) as con_err:
@@ -543,13 +551,7 @@ class ControllerAPIModule(ControllerModule):
                 controller_version = response.info().getheader('X-API-Product-Version', None)
 
             parsed_collection_version = Version(self._COLLECTION_VERSION).version
-            if not controller_version:
-                self.warn(
-                    "You are using the {0} version of this collection but connecting to a controller that did not return a version".format(
-                        self._COLLECTION_VERSION
-                    )
-                )
-            else:
+            if controller_version:
                 parsed_controller_version = Version(controller_version).version
                 if controller_type == 'AWX':
                     collection_compare_ver = parsed_collection_version[0]
@@ -588,55 +590,63 @@ class ControllerAPIModule(ControllerModule):
             status_code = response.status
         return {'status_code': status_code, 'json': response_json}
 
-    def authenticate(self, **kwargs):
-        if self.username and self.password:
-            # Attempt to get a token from /api/v2/tokens/ by giving it our username/password combo
-            # If we have a username and password, we need to get a session cookie
-            login_data = {
-                "description": "Automation Platform Controller Module Token",
-                "application": None,
-                "scope": "write",
-            }
-            # Preserve URL prefix
-            endpoint = self.url_prefix.rstrip('/') + '/api/v2/tokens/'
-            # Post to the tokens endpoint with baisc auth to try and get a token
-            api_token_url = (self.url._replace(path=endpoint)).geturl()
+    def api_path(self, app_key=None):
 
-            try:
-                response = self.session.open(
-                    'POST',
-                    api_token_url,
-                    validate_certs=self.verify_ssl,
-                    follow_redirects=True,
-                    force_basic_auth=True,
-                    url_username=self.username,
-                    url_password=self.password,
-                    data=dumps(login_data),
-                    headers={'Content-Type': 'application/json'},
+        default_api_path = "/api/"
+        if self._COLLECTION_TYPE != "awx" or app_key is not None:
+            if app_key is None:
+                app_key = "controller"
+
+            default_api_path = "/api/{0}/".format(app_key)
+
+        prefix = default_api_path
+        if app_key is None or app_key == "controller":
+            # if the env variable exists use it only when app is not defined or controller
+            controller_base_path = getenv(CONTROLLER_BASE_PATH_ENV_VAR)
+            if controller_base_path:
+                self.warn(
+                    "using controller base path from environment variable:"
+                    " {0} = {1}".format(CONTROLLER_BASE_PATH_ENV_VAR, controller_base_path)
                 )
-            except HTTPError as he:
-                try:
-                    resp = he.read()
-                except Exception as e:
-                    resp = 'unknown {0}'.format(e)
-                self.fail_json(msg='Failed to get token: {0}'.format(he), response=resp)
-            except (Exception) as e:
-                # Sanity check: Did the server send back some kind of internal error?
-                self.fail_json(msg='Failed to get token: {0}'.format(e))
+                prefix = controller_base_path
 
-            token_response = None
-            try:
-                token_response = response.read()
-                response_json = loads(token_response)
-                self.oauth_token_id = response_json['id']
-                self.oauth_token = response_json['token']
-            except (Exception) as e:
-                self.fail_json(msg="Failed to extract token information from login response: {0}".format(e), **{'response': token_response})
+        if not prefix.startswith('/'):
+            prefix = "/{0}".format(prefix)
 
-        # If we have neither of these, then we can try un-authenticated access
+        if not prefix.endswith('/'):
+            prefix = "{0}/".format(prefix)
+
+        return prefix
+
+    def _get_basic_authorization_header(self):
+        basic_credentials = b64encode("{0}:{1}".format(self.username, self.password).encode()).decode()
+        return "Basic {0}".format(basic_credentials)
+
+    def _authenticate_with_basic_auth(self):
+        if self.username and self.password:
+            # use api url /api/v2/me to get current user info as a testing request
+            me_url = self.build_url("me").geturl()
+            self.session.open(
+                "GET",
+                me_url,
+                validate_certs=self.verify_ssl,
+                timeout=self.request_timeout,
+                follow_redirects=True,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": self._get_basic_authorization_header(),
+                },
+            )
+
+    def authenticate(self, **kwargs):
+        try:
+            self._authenticate_with_basic_auth()
+        except Exception as exp:
+            self.fail_json(msg='Failed to get user info: {0}'.format(exp))
+
         self.authenticated = True
 
-    def delete_if_needed(self, existing_item, on_delete=None, auto_exit=True):
+    def delete_if_needed(self, existing_item, item_type=None, on_delete=None, auto_exit=True):
         # This will exit from the module on its own.
         # If the method successfully deletes an item and on_delete param is defined,
         #   the on_delete parameter will be called as a method pasing in this object and the json from the response
@@ -648,8 +658,9 @@ class ControllerAPIModule(ControllerModule):
             # If we have an item, we can try to delete it
             try:
                 item_url = existing_item['url']
-                item_type = existing_item['type']
                 item_id = existing_item['id']
+                if not item_type:
+                    item_type = existing_item['type']
                 item_name = self.get_item_name(existing_item, allow_unknown=True)
             except KeyError as ke:
                 self.fail_json(msg="Unable to process delete of item due to missing data {0}".format(ke))
@@ -692,17 +703,26 @@ class ControllerAPIModule(ControllerModule):
         response = self.get_all_endpoint(association_endpoint)
         existing_associated_ids = [association['id'] for association in response['json']['results']]
 
-        # Disassociate anything that is in existing_associated_ids but not in new_association_list
-        ids_to_remove = list(set(existing_associated_ids) - set(new_association_list))
-        for an_id in ids_to_remove:
+        # Some associations can be ordered (like galaxy credentials)
+        if association_endpoint.strip('/').split('/')[-1] in self.ordered_associations:
+            if existing_associated_ids == new_association_list:
+                return  # If the current associations EXACTLY match the desired associations then we can return
+            removal_list = existing_associated_ids  # because of ordering, we have to remove everything
+            addition_list = new_association_list  # re-add everything back in-order
+        else:
+            if set(existing_associated_ids) == set(new_association_list):
+                return
+            removal_list = set(existing_associated_ids) - set(new_association_list)
+            addition_list = set(new_association_list) - set(existing_associated_ids)
+
+        for an_id in removal_list:
             response = self.post_endpoint(association_endpoint, **{'data': {'id': int(an_id), 'disassociate': True}})
             if response['status_code'] == 204:
                 self.json_output['changed'] = True
             else:
                 self.fail_json(msg="Failed to disassociate item {0}".format(response['json'].get('detail', response['json'])))
 
-        # Associate anything that is in new_association_list but not in `association`
-        for an_id in list(set(new_association_list) - set(existing_associated_ids)):
+        for an_id in addition_list:
             response = self.post_endpoint(association_endpoint, **{'data': {'id': int(an_id)}})
             if response['status_code'] == 204:
                 self.json_output['changed'] = True
@@ -882,7 +902,7 @@ class ControllerAPIModule(ControllerModule):
                     return True
         return False
 
-    def update_if_needed(self, existing_item, new_item, on_update=None, auto_exit=True, associations=None):
+    def update_if_needed(self, existing_item, new_item, item_type=None, on_update=None, auto_exit=True, associations=None):
         # This will exit from the module on its own
         # If the method successfully updates an item and on_update param is defined,
         #   the on_update parameter will be called as a method pasing in this object and the json from the response
@@ -896,7 +916,8 @@ class ControllerAPIModule(ControllerModule):
             # If we have an item, we can see if it needs an update
             try:
                 item_url = existing_item['url']
-                item_type = existing_item['type']
+                if not item_type:
+                    item_type = existing_item['type']
                 if item_type == 'user':
                     item_name = existing_item['username']
                 elif item_type == 'workflow_job_template_node':
@@ -955,45 +976,24 @@ class ControllerAPIModule(ControllerModule):
     def create_or_update_if_needed(
         self, existing_item, new_item, endpoint=None, item_type='unknown', on_create=None, on_update=None, auto_exit=True, associations=None
     ):
+        # Remove boolean values of certain specific types
+        # this is needed so that boolean fields will not get a false value when not provided
+        for key in list(new_item.keys()):
+            if key in self.argument_spec:
+                param_spec = self.argument_spec[key]
+                if 'type' in param_spec and param_spec['type'] == 'bool':
+                    if new_item[key] is None:
+                        new_item.pop(key)
+
         if existing_item:
-            return self.update_if_needed(existing_item, new_item, on_update=on_update, auto_exit=auto_exit, associations=associations)
+            return self.update_if_needed(existing_item, new_item, item_type=item_type, on_update=on_update, auto_exit=auto_exit, associations=associations)
         else:
             return self.create_if_needed(
                 existing_item, new_item, endpoint, on_create=on_create, item_type=item_type, auto_exit=auto_exit, associations=associations
             )
 
     def logout(self):
-        if self.authenticated and self.oauth_token_id:
-            # Attempt to delete our current token from /api/v2/tokens/
-            # Post to the tokens endpoint with baisc auth to try and get a token
-            endpoint = self.url_prefix.rstrip('/') + '/api/v2/tokens/{0}/'.format(self.oauth_token_id)
-            api_token_url = (
-                self.url._replace(
-                    path=endpoint, query=None  # in error cases, fail_json exists before exception handling
-                )
-            ).geturl()
-
-            try:
-                self.session.open(
-                    'DELETE',
-                    api_token_url,
-                    validate_certs=self.verify_ssl,
-                    follow_redirects=True,
-                    force_basic_auth=True,
-                    url_username=self.username,
-                    url_password=self.password,
-                )
-                self.oauth_token_id = None
-                self.authenticated = False
-            except HTTPError as he:
-                try:
-                    resp = he.read()
-                except Exception as e:
-                    resp = 'unknown {0}'.format(e)
-                self.warn('Failed to release token: {0}, response: {1}'.format(he, resp))
-            except (Exception) as e:
-                # Sanity check: Did the server send back some kind of internal error?
-                self.warn('Failed to release token {0}: {1}'.format(self.oauth_token_id, e))
+        self.authenticated = False
 
     def is_job_done(self, job_status):
         if job_status in ['new', 'pending', 'waiting', 'running']:
@@ -1005,7 +1005,10 @@ class ControllerAPIModule(ControllerModule):
         # Grab our start time to compare against for the timeout
         start = time.time()
         result = self.get_endpoint(url)
-        while not result['json']['finished']:
+        wait_on_field = 'event_processing_finished'
+        if wait_on_field not in result['json']:
+            wait_on_field = 'finished'
+        while not result['json'][wait_on_field]:
             # If we are past our time out fail with a message
             if timeout and timeout < time.time() - start:
                 # Account for Legacy messages

@@ -6,13 +6,11 @@ import awx.main.fields
 from django.conf import settings
 from django.db import migrations, models
 import django.db.models.deletion
-import oauth2_provider.generators
 
 # TODO: Squash all of these migrations with '0024_v330_add_oauth_activity_stream_registrar'
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('main', '0032_v330_polymorphic_delete'),
     ]
@@ -55,7 +53,7 @@ class Migration(migrations.Migration):
             field=awx.main.fields.OAuth2ClientSecretField(
                 blank=True,
                 db_index=True,
-                default=oauth2_provider.generators.generate_client_secret,
+                default=lambda: "",
                 help_text='Used for more stringent verification of access to an application when creating a token.',
                 max_length=1024,
             ),

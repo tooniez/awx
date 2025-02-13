@@ -35,7 +35,7 @@ options:
       type: str
     organization:
       description:
-        - Name of the inventory source's inventory's organization.
+        - Name, ID, or named URL of the inventory source's inventory's organization.
       type: str
     wait:
       description:
@@ -94,7 +94,7 @@ def main():
         organization=dict(),
         wait=dict(default=False, type='bool'),
         interval=dict(default=2.0, type='float'),
-        timeout=dict(default=None, type='int'),
+        timeout=dict(type='int'),
     )
 
     # Create a module for ourselves

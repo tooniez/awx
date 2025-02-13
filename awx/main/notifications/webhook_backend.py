@@ -13,7 +13,6 @@ logger = logging.getLogger('awx.main.notifications.webhook_backend')
 
 
 class WebhookBackend(AWXBaseEmailBackend, CustomNotificationBase):
-
     MAX_RETRIES = 5
 
     init_parameters = {
@@ -28,17 +27,7 @@ class WebhookBackend(AWXBaseEmailBackend, CustomNotificationBase):
     sender_parameter = None
 
     DEFAULT_BODY = "{{ job_metadata }}"
-    default_messages = {
-        "started": {"body": DEFAULT_BODY},
-        "success": {"body": DEFAULT_BODY},
-        "error": {"body": DEFAULT_BODY},
-        "workflow_approval": {
-            "running": {"body": '{"body": "The approval node \\"{{ approval_node_name }}\\" needs review. ' 'This node can be viewed at: {{ workflow_url }}"}'},
-            "approved": {"body": '{"body": "The approval node \\"{{ approval_node_name }}\\" was approved. {{ workflow_url }}"}'},
-            "timed_out": {"body": '{"body": "The approval node \\"{{ approval_node_name }}\\" has timed out. {{ workflow_url }}"}'},
-            "denied": {"body": '{"body": "The approval node \\"{{ approval_node_name }}\\" was denied. {{ workflow_url }}"}'},
-        },
-    }
+    default_messages = CustomNotificationBase.job_metadata_messages
 
     def __init__(self, http_method, headers, disable_ssl_verification=False, fail_silently=False, username=None, password=None, **kwargs):
         self.http_method = http_method
@@ -65,7 +54,6 @@ class WebhookBackend(AWXBaseEmailBackend, CustomNotificationBase):
         chosen_method = getattr(requests, self.http_method.lower(), None)
 
         for m in messages:
-
             auth = None
             if self.username or self.password:
                 auth = (self.username, self.password)
@@ -82,7 +70,6 @@ class WebhookBackend(AWXBaseEmailBackend, CustomNotificationBase):
             err = None
 
             for retries in range(self.MAX_RETRIES):
-
                 # Sometimes we hit redirect URLs. We must account for this. We still extract the redirect URL from the response headers and try again. Max retires == 5
                 resp = chosen_method(
                     url=url,

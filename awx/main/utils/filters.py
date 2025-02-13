@@ -1,5 +1,7 @@
 import re
 from functools import reduce
+
+from django.core.exceptions import FieldDoesNotExist
 from pyparsing import (
     infixNotation,
     opAssoc,
@@ -63,7 +65,6 @@ def record_is_blocked(record):
 
 
 class ExternalLoggerEnabled(Filter):
-
     enabled_loggers = FieldFromSettings('LOG_AGGREGATOR_LOGGERS')
     enabled_flag = FieldFromSettings('LOG_AGGREGATOR_ENABLED')
 
@@ -162,7 +163,7 @@ class SmartFilter(object):
             else:
                 # detect loops and restrict access to sensitive fields
                 # this import is intentional here to avoid a circular import
-                from awx.api.filters import FieldLookupBackend
+                from ansible_base.rest_filters.rest_framework.field_lookup_backend import FieldLookupBackend
 
                 FieldLookupBackend().get_field_from_lookup(Host, k)
                 kwargs[k] = v
@@ -325,7 +326,6 @@ class SmartFilter(object):
 
     @classmethod
     def query_from_string(cls, filter_string):
-
         """
         TODO:
         * handle values with " via: a.b.c.d="hello\"world"
@@ -355,7 +355,7 @@ class SmartFilter(object):
 
         try:
             res = boolExpr.parseString('(' + filter_string + ')')
-        except ParseException:
+        except (ParseException, FieldDoesNotExist):
             raise RuntimeError(u"Invalid query %s" % filter_string_raw)
 
         if len(res) > 0:

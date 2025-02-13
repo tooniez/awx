@@ -30,12 +30,6 @@ def add_authentication_arguments(parser, env):
         default=env.get('CONTROLLER_HOST', env.get('TOWER_HOST', 'https://127.0.0.1:443')),
         metavar='https://example.awx.org',
     )
-    auth.add_argument(
-        '--conf.token',
-        default=env.get('CONTROLLER_OAUTH_TOKEN', env.get('CONTROLLER_TOKEN', env.get('TOWER_OAUTH_TOKEN', env.get('TOWER_TOKEN', '')))),
-        help='an OAuth2.0 token (get one by using `awx login`)',
-        metavar='TEXT',
-    )
 
     config_username, config_password = get_config_credentials()
     # options configured via cli args take higher precedence than those from the config
@@ -139,7 +133,7 @@ def format_jq(output, fmt):
         if fmt == '.':
             return output
         raise ImportError(
-            'To use `-f jq`, you must install the optional jq dependency.\n' '`pip install jq`\n',
+            'To use `-f jq`, you must install the optional jq dependency.\n`pip install jq`\n',
             'Note that some platforms may require additional programs to '
             'build jq from source (like `libtool`).\n'
             'See https://pypi.org/project/jq/ for instructions.',
@@ -185,7 +179,7 @@ def format_human(output, fmt):
 
     def format_num(v):
         try:
-            return locale.format("%.*f", (0, int(v)), True)
+            return locale.format_string("%.*f", (0, int(v)), True)
         except (ValueError, TypeError):
             if isinstance(v, (list, dict)):
                 return json.dumps(v)

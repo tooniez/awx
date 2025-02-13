@@ -2,6 +2,7 @@
 import logging
 
 # Django
+from django.core.checks import Error
 from django.utils.translation import gettext_lazy as _
 
 # Django REST Framework
@@ -10,7 +11,7 @@ from rest_framework import serializers
 # AWX
 from awx.conf import fields, register, register_validate
 from awx.main.models import ExecutionEnvironment
-
+from awx.main.constants import SUBSCRIPTION_USAGE_MODEL_UNIQUE_HOSTS
 
 logger = logging.getLogger('awx.main.conf')
 
@@ -45,10 +46,7 @@ register(
     'MANAGE_ORGANIZATION_AUTH',
     field_class=fields.BooleanField,
     label=_('Organization Admins Can Manage Users and Teams'),
-    help_text=_(
-        'Controls whether any Organization Admin has the privileges to create and manage users and teams. '
-        'You may want to disable this ability if you are using an LDAP or SAML integration.'
-    ),
+    help_text=_('Controls whether any Organization Admin has the privileges to create and manage users and teams.'),
     category=_('System'),
     category_slug='system',
 )
@@ -89,6 +87,21 @@ register(
         "custom REMOTE_HOST_HEADERS header values. "
         "If this setting is an empty list (the default), the headers specified by "
         "REMOTE_HOST_HEADERS will be trusted unconditionally')"
+    ),
+    category=_('System'),
+    category_slug='system',
+    required=False,
+)
+
+register(
+    'CSRF_TRUSTED_ORIGINS',
+    default=[],
+    field_class=fields.StringListField,
+    label=_('CSRF Trusted Origins List'),
+    help_text=_(
+        "If the service is behind a reverse proxy/load balancer, use this setting "
+        "to configure the schema://addresses from which the service should trust "
+        "Origin header values. "
     ),
     category=_('System'),
     category_slug='system',
@@ -280,6 +293,16 @@ register(
     category=_('Jobs'),
     category_slug='jobs',
     placeholder={'HTTP_PROXY': 'myproxy.local:8080'},
+)
+
+register(
+    'AWX_RUNNER_KEEPALIVE_SECONDS',
+    field_class=fields.IntegerField,
+    label=_('K8S Ansible Runner Keep-Alive Message Interval'),
+    help_text=_('Only applies to jobs running in a Container Group. If not 0, send a message every so-many seconds to keep connection open.'),
+    category=_('Jobs'),
+    category_slug='jobs',
+    placeholder=240,  # intended to be under common 5 minute idle timeout
 )
 
 register(
@@ -569,7 +592,7 @@ register(
 register(
     'LOG_AGGREGATOR_LOGGERS',
     field_class=fields.StringListField,
-    default=['awx', 'activity_stream', 'job_events', 'system_tracking', 'broadcast_websocket'],
+    default=['awx', 'activity_stream', 'job_events', 'system_tracking', 'broadcast_websocket', 'job_lifecycle'],
     label=_('Loggers Sending Data to Log Aggregator Form'),
     help_text=_(
         'List of loggers that will send HTTP logs to the collector, these can '
@@ -579,6 +602,7 @@ register(
         'job_events - callback data from Ansible job events\n'
         'system_tracking - facts gathered from scan jobs\n'
         'broadcast_websocket - errors pertaining to websockets broadcast metrics\n'
+        'job_lifecycle - logs related to processing of a job\n'
     ),
     category=_('Logging'),
     category_slug='logging',
@@ -670,15 +694,33 @@ register(
     category_slug='logging',
 )
 register(
-    'LOG_AGGREGATOR_MAX_DISK_USAGE_GB',
+    'LOG_AGGREGATOR_ACTION_QUEUE_SIZE',
+    field_class=fields.IntegerField,
+    default=131072,
+    min_value=1,
+    label=_('Maximum number of messages that can be stored in the log action queue'),
+    help_text=_(
+        'Defines how large the rsyslog action queue can grow in number of messages '
+        'stored. This can have an impact on memory utilization. When the queue '
+        'reaches 75% of this number, the queue will start writing to disk '
+        '(queue.highWatermark in rsyslog). When it reaches 90%, NOTICE, INFO, and '
+        'DEBUG messages will start to be discarded (queue.discardMark with '
+        'queue.discardSeverity=5).'
+    ),
+    category=_('Logging'),
+    category_slug='logging',
+)
+register(
+    'LOG_AGGREGATOR_ACTION_MAX_DISK_USAGE_GB',
     field_class=fields.IntegerField,
     default=1,
     min_value=1,
-    label=_('Maximum disk persistance for external log aggregation (in GB)'),
+    label=_('Maximum disk persistence for rsyslogd action queuing (in GB)'),
     help_text=_(
-        'Amount of data to store (in gigabytes) during an outage of '
-        'the external log aggregator (defaults to 1). '
-        'Equivalent to the rsyslogd queue.maxdiskspace setting.'
+        'Amount of data to store (in gigabytes) if an rsyslog action takes time '
+        'to process an incoming message (defaults to 1). '
+        'Equivalent to the rsyslogd queue.maxdiskspace setting on the action (e.g. omhttp). '
+        'It stores files in the directory specified by LOG_AGGREGATOR_MAX_DISK_USAGE_PATH.'
     ),
     category=_('Logging'),
     category_slug='logging',
@@ -732,6 +774,8 @@ register(
     allow_null=True,
     category=_('System'),
     category_slug='system',
+    required=False,
+    hidden=True,
 )
 register(
     'AUTOMATION_ANALYTICS_LAST_ENTRIES',
@@ -765,6 +809,127 @@ register(
     help_text=_('Indicates whether the instance is part of a kubernetes-based deployment.'),
 )
 
+register(
+    'BULK_JOB_MAX_LAUNCH',
+    field_class=fields.IntegerField,
+    default=100,
+    label=_('Max jobs to allow bulk jobs to launch'),
+    help_text=_('Max jobs to allow bulk jobs to launch'),
+    category=_('Bulk Actions'),
+    category_slug='bulk',
+    hidden=True,
+)
+
+register(
+    'BULK_HOST_MAX_CREATE',
+    field_class=fields.IntegerField,
+    default=100,
+    label=_('Max number of hosts to allow to be created in a single bulk action'),
+    help_text=_('Max number of hosts to allow to be created in a single bulk action'),
+    category=_('Bulk Actions'),
+    category_slug='bulk',
+    hidden=True,
+)
+
+register(
+    'BULK_HOST_MAX_DELETE',
+    field_class=fields.IntegerField,
+    default=250,
+    label=_('Max number of hosts to allow to be deleted in a single bulk action'),
+    help_text=_('Max number of hosts to allow to be deleted in a single bulk action'),
+    category=_('Bulk Actions'),
+    category_slug='bulk',
+    hidden=True,
+)
+
+
+register(
+    'SUBSCRIPTION_USAGE_MODEL',
+    field_class=fields.ChoiceField,
+    choices=[
+        ('', _('No subscription. Deletion of host_metrics will not be considered for purposes of managed host counting')),
+        (
+            SUBSCRIPTION_USAGE_MODEL_UNIQUE_HOSTS,
+            _('Usage based on unique managed nodes in a large historical time frame and delete functionality for no longer used managed nodes'),
+        ),
+    ],
+    default='',
+    allow_blank=True,
+    label=_('Defines subscription usage model and shows Host Metrics'),
+    category=_('System'),
+    category_slug='system',
+)
+
+register(
+    'CLEANUP_HOST_METRICS_LAST_TS',
+    field_class=fields.DateTimeField,
+    label=_('Last cleanup date for HostMetrics'),
+    allow_null=True,
+    category=_('System'),
+    category_slug='system',
+    hidden=True,
+)
+
+register(
+    'HOST_METRIC_SUMMARY_TASK_LAST_TS',
+    field_class=fields.DateTimeField,
+    label=_('Last computing date of HostMetricSummaryMonthly'),
+    allow_null=True,
+    category=_('System'),
+    category_slug='system',
+    hidden=True,
+)
+
+register(
+    'AWX_CLEANUP_PATHS',
+    field_class=fields.BooleanField,
+    label=_('Enable or Disable tmp dir cleanup'),
+    default=True,
+    help_text=_('Enable or Disable TMP Dir cleanup'),
+    category=('Debug'),
+    category_slug='debug',
+)
+
+register(
+    'AWX_REQUEST_PROFILE',
+    field_class=fields.BooleanField,
+    label=_('Debug Web Requests'),
+    default=False,
+    help_text=_('Debug web request python timing'),
+    category=('Debug'),
+    category_slug='debug',
+)
+
+register(
+    'DEFAULT_CONTAINER_RUN_OPTIONS',
+    field_class=fields.StringListField,
+    label=_('Container Run Options'),
+    default=['--network', 'slirp4netns:enable_ipv6=true'],
+    help_text=_("List of options to pass to podman run example: ['--network', 'slirp4netns:enable_ipv6=true', '--log-level', 'debug']"),
+    category=('Jobs'),
+    category_slug='jobs',
+)
+
+register(
+    'RECEPTOR_RELEASE_WORK',
+    field_class=fields.BooleanField,
+    label=_('Release Receptor Work'),
+    default=True,
+    help_text=_('Release receptor work'),
+    category=('Debug'),
+    category_slug='debug',
+)
+
+register(
+    'RECEPTOR_KEEP_WORK_ON_ERROR',
+    field_class=fields.BooleanField,
+    label=_('Keep receptor work on error'),
+    default=False,
+    help_text=_('Prevent receptor work from being released on when error is detected'),
+    category=('Debug'),
+    category_slug='debug',
+)
+
 
 def logging_validate(serializer, attrs):
     if not serializer.instance or not hasattr(serializer.instance, 'LOG_AGGREGATOR_HOST') or not hasattr(serializer.instance, 'LOG_AGGREGATOR_TYPE'):
@@ -791,3 +956,27 @@ def logging_validate(serializer, attrs):
 
 
 register_validate('logging', logging_validate)
+
+
+def csrf_trusted_origins_validate(serializer, attrs):
+    if not serializer.instance or not hasattr(serializer.instance, 'CSRF_TRUSTED_ORIGINS'):
+        return attrs
+    if 'CSRF_TRUSTED_ORIGINS' not in attrs:
+        return attrs
+    errors = []
+    for origin in attrs['CSRF_TRUSTED_ORIGINS']:
+        if "://" not in origin:
+            errors.append(
+                Error(
+                    "As of Django 4.0, the values in the CSRF_TRUSTED_ORIGINS "
+                    "setting must start with a scheme (usually http:// or "
+                    "https://) but found %s. See the release notes for details." % origin,
+                )
+            )
+    if errors:
+        error_messages = [error.msg for error in errors]
+        raise serializers.ValidationError(_('\n'.join(error_messages)))
+    return attrs
+
+
+register_validate('system', csrf_trusted_origins_validate)

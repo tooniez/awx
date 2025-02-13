@@ -5,27 +5,36 @@ from decimal import Decimal
 import logging
 import os
 
-from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.validators import MinValueValidator
 from django.db import models, connection
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 from django.utils.translation import gettext_lazy as _
 from django.conf import settings
 from django.utils.timezone import now, timedelta
-from django.db.models import Sum
+from django.db.models import Sum, Q
 
 import redis
 from solo.models import SingletonModel
 
+from ansible_base.lib.utils.models import prevent_search
+
+# AWX
 from awx import __version__ as awx_application_version
+from awx.main.utils import is_testing
 from awx.api.versioning import reverse
-from awx.main.fields import JSONBlob
+from awx.main.fields import ImplicitRoleField
 from awx.main.managers import InstanceManager, UUID_DEFAULT
 from awx.main.constants import JOB_FOLDER_PREFIX
-from awx.main.models.base import BaseModel, HasEditsMixin, prevent_search
+from awx.main.models.base import BaseModel, HasEditsMixin
+from awx.main.models.rbac import (
+    ROLE_SINGLETON_SYSTEM_ADMINISTRATOR,
+    ROLE_SINGLETON_SYSTEM_AUDITOR,
+)
 from awx.main.models.unified_jobs import UnifiedJob
 from awx.main.utils.common import get_corrected_cpu, get_cpu_effective_capacity, get_corrected_memory, get_mem_effective_capacity
-from awx.main.models.mixins import RelatedJobsMixin
+from awx.main.models.mixins import RelatedJobsMixin, ResourceMixin
+from awx.main.models.receptor_address import ReceptorAddress
 
 # ansible-runner
 from ansible_runner.utils.capacity import get_cpu_count, get_mem_in_bytes
@@ -56,8 +65,19 @@ class HasPolicyEditsMixin(HasEditsMixin):
 
 
 class InstanceLink(BaseModel):
-    source = models.ForeignKey('Instance', on_delete=models.CASCADE, related_name='+')
-    target = models.ForeignKey('Instance', on_delete=models.CASCADE, related_name='reverse_peers')
+    class Meta:
+        ordering = ("id",)
+        # add constraint for source and target to be unique together
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source", "target"],
+                name="unique_source_target",
+                violation_error_message=_("Field source and target must be unique together."),
+            )
+        ]
+
+    source = models.ForeignKey('Instance', on_delete=models.CASCADE, help_text=_("The source instance of this peer link."))
+    target = models.ForeignKey('ReceptorAddress', on_delete=models.CASCADE, help_text=_("The target receptor address of this peer link."))
 
     class States(models.TextChoices):
         ADDING = 'adding', _('Adding')
@@ -65,15 +85,27 @@ class InstanceLink(BaseModel):
         REMOVING = 'removing', _('Removing')
 
     link_state = models.CharField(
-        choices=States.choices, default=States.ESTABLISHED, max_length=16, help_text=_("Indicates the current life cycle stage of this peer link.")
+        choices=States.choices, default=States.ADDING, max_length=16, help_text=_("Indicates the current life cycle stage of this peer link.")
     )
-
-    class Meta:
-        unique_together = ('source', 'target')
 
 
 class Instance(HasPolicyEditsMixin, BaseModel):
     """A model representing an AWX instance running against this database."""
+
+    class Meta:
+        app_label = 'main'
+        ordering = ("hostname",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ip_address"],
+                condition=~Q(ip_address=""),  # don't apply to constraint to empty entries
+                name="unique_ip_address_not_empty",
+                violation_error_message=_("Field ip_address must be unique."),
+            )
+        ]
+
+    def __str__(self):
+        return self.hostname
 
     objects = InstanceManager()
 
@@ -82,11 +114,10 @@ class Instance(HasPolicyEditsMixin, BaseModel):
     hostname = models.CharField(max_length=250, unique=True)
     ip_address = models.CharField(
         blank=True,
-        null=True,
-        default=None,
+        default="",
         max_length=50,
-        unique=True,
     )
+
     # Auto-fields, implementation is different from BaseModel
     created = models.DateTimeField(auto_now_add=True)
     modified = models.DateTimeField(auto_now=True)
@@ -129,7 +160,7 @@ class Instance(HasPolicyEditsMixin, BaseModel):
         default=100,
         editable=False,
     )
-    capacity_adjustment = models.DecimalField(default=Decimal(1.0), max_digits=3, decimal_places=2, validators=[MinValueValidator(0)])
+    capacity_adjustment = models.DecimalField(default=Decimal(1.0), max_digits=3, decimal_places=2, validators=[MinValueValidator(Decimal(0.0))])
     enabled = models.BooleanField(default=True)
     managed_by_policy = models.BooleanField(default=True)
 
@@ -162,18 +193,9 @@ class Instance(HasPolicyEditsMixin, BaseModel):
     node_state = models.CharField(
         choices=States.choices, default=States.READY, max_length=16, help_text=_("Indicates the current life cycle stage of this instance.")
     )
-    listener_port = models.PositiveIntegerField(
-        blank=True,
-        default=27199,
-        validators=[MinValueValidator(1), MaxValueValidator(65535)],
-        help_text=_("Port that Receptor will listen for incoming connections on."),
-    )
 
-    peers = models.ManyToManyField('self', symmetrical=False, through=InstanceLink, through_fields=('source', 'target'))
-
-    class Meta:
-        app_label = 'main'
-        ordering = ("hostname",)
+    managed = models.BooleanField(help_text=_("If True, this instance is managed by the control plane."), default=False, editable=False)
+    peers = models.ManyToManyField('ReceptorAddress', through=InstanceLink, through_fields=('source', 'target'), related_name='peers_from')
 
     POLICY_FIELDS = frozenset(('managed_by_policy', 'hostname', 'capacity_adjustment'))
 
@@ -219,6 +241,26 @@ class Instance(HasPolicyEditsMixin, BaseModel):
         if self.last_health_check is None:
             return True
         return self.health_check_started > self.last_health_check
+
+    @property
+    def canonical_address(self):
+        return self.receptor_addresses.filter(canonical=True).first()
+
+    @property
+    def canonical_address_port(self):
+        # note: don't create a different query for receptor addresses, as this is prefetched on the View for optimization
+        for addr in self.receptor_addresses.all():
+            if addr.canonical:
+                return addr.port
+        return None
+
+    @property
+    def canonical_address_peers_from_control_nodes(self):
+        # note: don't create a different query for receptor addresses, as this is prefetched on the View for optimization
+        for addr in self.receptor_addresses.all():
+            if addr.canonical:
+                return addr.peers_from_control_nodes
+        return False
 
     def get_cleanup_task_kwargs(self, **kwargs):
         """
@@ -270,10 +312,14 @@ class Instance(HasPolicyEditsMixin, BaseModel):
         if update_last_seen:
             update_fields += ['last_seen']
         if perform_save:
-            self.save(update_fields=update_fields)
+            from awx.main.signals import disable_activity_stream
+
+            with disable_activity_stream():
+                self.save(update_fields=update_fields)
         return update_fields
 
     def set_capacity_value(self):
+        old_val = self.capacity
         """Sets capacity according to capacity adjustment rule (no save)"""
         if self.enabled and self.node_type != 'hop':
             lower_cap = min(self.mem_capacity, self.cpu_capacity)
@@ -281,6 +327,7 @@ class Instance(HasPolicyEditsMixin, BaseModel):
             self.capacity = lower_cap + (higher_cap - lower_cap) * self.capacity_adjustment
         else:
             self.capacity = 0
+        return int(self.capacity) != int(old_val)  # return True if value changed
 
     def refresh_capacity_fields(self):
         """Update derived capacity fields from cpu and memory (no save)"""
@@ -288,8 +335,8 @@ class Instance(HasPolicyEditsMixin, BaseModel):
             self.cpu_capacity = 0
             self.mem_capacity = 0  # formula has a non-zero offset, so we make sure it is 0 for hop nodes
         else:
-            self.cpu_capacity = get_cpu_effective_capacity(self.cpu)
-            self.mem_capacity = get_mem_effective_capacity(self.memory)
+            self.cpu_capacity = get_cpu_effective_capacity(self.cpu, is_control_node=bool(self.node_type in (Instance.Types.CONTROL, Instance.Types.HYBRID)))
+            self.mem_capacity = get_mem_effective_capacity(self.memory, is_control_node=bool(self.node_type in (Instance.Types.CONTROL, Instance.Types.HYBRID)))
         self.set_capacity_value()
 
     def save_health_data(self, version=None, cpu=0, memory=0, uuid=None, update_last_seen=False, errors=''):
@@ -312,12 +359,17 @@ class Instance(HasPolicyEditsMixin, BaseModel):
             self.version = version
             update_fields.append('version')
 
-        new_cpu = get_corrected_cpu(cpu)
+        if self.node_type == Instance.Types.EXECUTION:
+            new_cpu = cpu
+            new_memory = memory
+        else:
+            new_cpu = get_corrected_cpu(cpu)
+            new_memory = get_corrected_memory(memory)
+
         if new_cpu != self.cpu:
             self.cpu = new_cpu
             update_fields.append('cpu')
 
-        new_memory = get_corrected_memory(memory)
         if new_memory != self.memory:
             self.memory = new_memory
             update_fields.append('memory')
@@ -352,7 +404,7 @@ class Instance(HasPolicyEditsMixin, BaseModel):
         self.save_health_data(awx_application_version, get_cpu_count(), get_mem_in_bytes(), update_last_seen=True, errors=errors)
 
 
-class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin):
+class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin, ResourceMixin):
     """A model representing a Queue/Group of AWX Instances."""
 
     name = models.CharField(max_length=250, unique=True)
@@ -379,11 +431,29 @@ class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin):
             default='',
         )
     )
+    admin_role = ImplicitRoleField(
+        parent_role=[
+            'singleton:' + ROLE_SINGLETON_SYSTEM_ADMINISTRATOR,
+        ]
+    )
+    use_role = ImplicitRoleField(
+        parent_role=[
+            'admin_role',
+        ]
+    )
+    read_role = ImplicitRoleField(
+        parent_role=[
+            'singleton:' + ROLE_SINGLETON_SYSTEM_AUDITOR,
+            'use_role',
+            'admin_role',
+        ]
+    )
+
     max_concurrent_jobs = models.IntegerField(default=0, help_text=_("Maximum number of concurrent jobs to run on this group. Zero means no limit."))
     max_forks = models.IntegerField(default=0, help_text=_("Max forks to execute on this group. Zero means no limit."))
     policy_instance_percentage = models.IntegerField(default=0, help_text=_("Percentage of Instances to automatically assign to this group"))
     policy_instance_minimum = models.IntegerField(default=0, help_text=_("Static minimum number of Instances to automatically assign to this group"))
-    policy_instance_list = JSONBlob(
+    policy_instance_list = models.JSONField(
         default=list, blank=True, help_text=_("List of exact-match Instances that will always be automatically assigned to this group")
     )
 
@@ -415,6 +485,9 @@ class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin):
 
     class Meta:
         app_label = 'main'
+        permissions = [('use_instancegroup', 'Can use instance group in a preference list of a resource')]
+        # Since this has no direct organization field only superuser can add, so remove add permission
+        default_permissions = ('change', 'delete', 'view')
 
     def set_default_policy_fields(self):
         self.policy_instance_list = []
@@ -441,21 +514,72 @@ def on_instance_group_saved(sender, instance, created=False, raw=False, **kwargs
         instance.set_default_policy_fields()
 
 
+def schedule_write_receptor_config(broadcast=True):
+    from awx.main.tasks.receptor import write_receptor_config  # prevents circular import
+
+    # broadcast to all control instances to update their receptor configs
+    if broadcast:
+        connection.on_commit(lambda: write_receptor_config.apply_async(queue='tower_broadcast_all'))
+    else:
+        if not is_testing():
+            write_receptor_config()  # just run locally
+
+
+@receiver(post_save, sender=ReceptorAddress)
+def receptor_address_saved(sender, instance, **kwargs):
+    from awx.main.signals import disable_activity_stream
+
+    address = instance
+
+    control_instances = set(Instance.objects.filter(node_type__in=[Instance.Types.CONTROL, Instance.Types.HYBRID]))
+    if address.peers_from_control_nodes:
+        # if control_instances is not a subset of current peers of address, then
+        # that means we need to add some InstanceLinks
+        if not control_instances <= set(address.peers_from.all()):
+            with disable_activity_stream():
+                for control_instance in control_instances:
+                    InstanceLink.objects.update_or_create(source=control_instance, target=address)
+                schedule_write_receptor_config()
+    else:
+        if address.peers_from.exists():
+            with disable_activity_stream():
+                address.peers_from.remove(*control_instances)
+                schedule_write_receptor_config()
+
+
+@receiver(post_delete, sender=ReceptorAddress)
+def receptor_address_deleted(sender, instance, **kwargs):
+    address = instance
+    if address.peers_from_control_nodes:
+        schedule_write_receptor_config()
+
+
 @receiver(post_save, sender=Instance)
 def on_instance_saved(sender, instance, created=False, raw=False, **kwargs):
-    if settings.IS_K8S and instance.node_type in (Instance.Types.EXECUTION,):
+    '''
+    Here we link control nodes to hop or execution nodes based on the
+    peers_from_control_nodes field.
+    write_receptor_config should be called on each control node when:
+    1. new node is created with peers_from_control_nodes enabled
+    2. a node changes its value of peers_from_control_nodes
+    3. a new control node comes online and has instances to peer to
+    '''
+    from awx.main.signals import disable_activity_stream
+
+    if created and settings.IS_K8S and instance.node_type in [Instance.Types.CONTROL, Instance.Types.HYBRID]:
+        peers_addresses = ReceptorAddress.objects.filter(peers_from_control_nodes=True)
+        if peers_addresses.exists():
+            with disable_activity_stream():
+                instance.peers.add(*peers_addresses)
+                schedule_write_receptor_config(broadcast=False)
+
+    if settings.IS_K8S and instance.node_type in [Instance.Types.HOP, Instance.Types.EXECUTION]:
         if instance.node_state == Instance.States.DEPROVISIONING:
             from awx.main.tasks.receptor import remove_deprovisioned_node  # prevents circular import
 
             # wait for jobs on the node to complete, then delete the
             # node and kick off write_receptor_config
             connection.on_commit(lambda: remove_deprovisioned_node.apply_async([instance.hostname]))
-
-        if instance.node_state == Instance.States.INSTALLED:
-            from awx.main.tasks.receptor import write_receptor_config  # prevents circular import
-
-            # broadcast to all control instances to update their receptor configs
-            connection.on_commit(lambda: write_receptor_config.apply_async(queue='tower_broadcast_all'))
 
     if created or instance.has_policy_changes():
         schedule_policy_task()
@@ -473,7 +597,6 @@ def on_instance_deleted(sender, instance, using, **kwargs):
 
 
 class UnifiedJobTemplateInstanceGroupMembership(models.Model):
-
     unifiedjobtemplate = models.ForeignKey('UnifiedJobTemplate', on_delete=models.CASCADE)
     instancegroup = models.ForeignKey('InstanceGroup', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(
@@ -484,7 +607,6 @@ class UnifiedJobTemplateInstanceGroupMembership(models.Model):
 
 
 class OrganizationInstanceGroupMembership(models.Model):
-
     organization = models.ForeignKey('Organization', on_delete=models.CASCADE)
     instancegroup = models.ForeignKey('InstanceGroup', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(
@@ -495,7 +617,6 @@ class OrganizationInstanceGroupMembership(models.Model):
 
 
 class InventoryInstanceGroupMembership(models.Model):
-
     inventory = models.ForeignKey('Inventory', on_delete=models.CASCADE)
     instancegroup = models.ForeignKey('InstanceGroup', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(
@@ -506,7 +627,6 @@ class InventoryInstanceGroupMembership(models.Model):
 
 
 class JobLaunchConfigInstanceGroupMembership(models.Model):
-
     joblaunchconfig = models.ForeignKey('JobLaunchConfig', on_delete=models.CASCADE)
     instancegroup = models.ForeignKey('InstanceGroup', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(
@@ -517,7 +637,6 @@ class JobLaunchConfigInstanceGroupMembership(models.Model):
 
 
 class ScheduleInstanceGroupMembership(models.Model):
-
     schedule = models.ForeignKey('Schedule', on_delete=models.CASCADE)
     instancegroup = models.ForeignKey('InstanceGroup', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(
@@ -528,7 +647,6 @@ class ScheduleInstanceGroupMembership(models.Model):
 
 
 class WorkflowJobTemplateNodeBaseInstanceGroupMembership(models.Model):
-
     workflowjobtemplatenode = models.ForeignKey('WorkflowJobTemplateNode', on_delete=models.CASCADE)
     instancegroup = models.ForeignKey('InstanceGroup', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(
@@ -539,7 +657,6 @@ class WorkflowJobTemplateNodeBaseInstanceGroupMembership(models.Model):
 
 
 class WorkflowJobNodeBaseInstanceGroupMembership(models.Model):
-
     workflowjobnode = models.ForeignKey('WorkflowJobNode', on_delete=models.CASCADE)
     instancegroup = models.ForeignKey('InstanceGroup', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(
@@ -550,7 +667,6 @@ class WorkflowJobNodeBaseInstanceGroupMembership(models.Model):
 
 
 class WorkflowJobInstanceGroupMembership(models.Model):
-
     workflowjobnode = models.ForeignKey('WorkflowJob', on_delete=models.CASCADE)
     instancegroup = models.ForeignKey('InstanceGroup', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(

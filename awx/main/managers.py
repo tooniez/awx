@@ -2,11 +2,14 @@
 # All Rights Reserved.
 
 import logging
+import uuid
 from django.db import models
 from django.conf import settings
 from django.db.models.functions import Lower
+
+from ansible_base.lib.utils.db import advisory_lock
+
 from awx.main.utils.filters import SmartFilter
-from awx.main.utils.pglock import advisory_lock
 from awx.main.constants import RECEPTOR_PENDING
 
 ___all__ = ['HostManager', 'InstanceManager', 'DeferJobCreatedManager', 'UUID_DEFAULT']
@@ -79,6 +82,11 @@ class HostManager(models.Manager):
         return qs
 
 
+class HostMetricActiveManager(models.Manager):
+    def get_queryset(self):
+        return super().get_queryset().filter(deleted=False)
+
+
 def get_ig_ig_mapping(ig_instance_mapping, instance_ig_mapping):
     # Create IG mapping by union of all groups their instances are members of
     ig_ig_mapping = {}
@@ -109,25 +117,36 @@ class InstanceManager(models.Manager):
             return node[0]
         raise RuntimeError("No instance found with the current cluster host id")
 
-    def register(self, uuid=None, hostname=None, ip_address=None, node_type='hybrid', defaults=None):
+    def register(
+        self,
+        node_uuid=None,
+        hostname=None,
+        ip_address="",
+        node_type='hybrid',
+        defaults=None,
+    ):
         if not hostname:
             hostname = settings.CLUSTER_HOST_ID
+
+        if not ip_address:
+            ip_address = ""
 
         with advisory_lock('instance_registration_%s' % hostname):
             if settings.AWX_AUTO_DEPROVISION_INSTANCES:
                 # detect any instances with the same IP address.
-                # if one exists, set it to None
-                inst_conflicting_ip = self.filter(ip_address=ip_address).exclude(hostname=hostname)
-                if inst_conflicting_ip.exists():
-                    for other_inst in inst_conflicting_ip:
-                        other_hostname = other_inst.hostname
-                        other_inst.ip_address = None
-                        other_inst.save(update_fields=['ip_address'])
-                        logger.warning("IP address {0} conflict detected, ip address unset for host {1}.".format(ip_address, other_hostname))
+                # if one exists, set it to ""
+                if ip_address:
+                    inst_conflicting_ip = self.filter(ip_address=ip_address).exclude(hostname=hostname)
+                    if inst_conflicting_ip.exists():
+                        for other_inst in inst_conflicting_ip:
+                            other_hostname = other_inst.hostname
+                            other_inst.ip_address = ""
+                            other_inst.save(update_fields=['ip_address'])
+                            logger.warning("IP address {0} conflict detected, ip address unset for host {1}.".format(ip_address, other_hostname))
 
             # Return existing instance that matches hostname or UUID (default to UUID)
-            if uuid is not None and uuid != UUID_DEFAULT and self.filter(uuid=uuid).exists():
-                instance = self.filter(uuid=uuid)
+            if node_uuid is not None and node_uuid != UUID_DEFAULT and self.filter(uuid=node_uuid).exists():
+                instance = self.filter(uuid=node_uuid)
             else:
                 # if instance was not retrieved by uuid and hostname was, use the hostname
                 instance = self.filter(hostname=hostname)
@@ -158,13 +177,16 @@ class InstanceManager(models.Manager):
                     return (False, instance)
 
             # Create new instance, and fill in default values
-            create_defaults = {'node_state': Instance.States.INSTALLED, 'capacity': 0}
+            create_defaults = {
+                'node_state': Instance.States.INSTALLED,
+                'capacity': 0,
+                'managed': True,
+            }
             if defaults is not None:
                 create_defaults.update(defaults)
-            uuid_option = {}
-            if uuid is not None:
-                uuid_option = {'uuid': uuid}
+            uuid_option = {'uuid': node_uuid if node_uuid is not None else uuid.uuid4()}
             if node_type == 'execution' and 'version' not in create_defaults:
                 create_defaults['version'] = RECEPTOR_PENDING
             instance = self.create(hostname=hostname, ip_address=ip_address, node_type=node_type, **create_defaults, **uuid_option)
+
         return (True, instance)

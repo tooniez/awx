@@ -36,11 +36,13 @@ class Metadata(metadata.SimpleMetadata):
         field_info = OrderedDict()
         field_info['type'] = self.label_lookup[field]
         field_info['required'] = getattr(field, 'required', False)
+        field_info['hidden'] = getattr(field, 'hidden', False)
 
         text_attrs = [
             'read_only',
             'label',
             'help_text',
+            'warning_text',
             'min_length',
             'max_length',
             'min_value',
@@ -71,7 +73,7 @@ class Metadata(metadata.SimpleMetadata):
                 'url': _('URL for this {}.'),
                 'related': _('Data structure with URLs of related resources.'),
                 'summary_fields': _(
-                    'Data structure with name/description for related resources.  ' 'The output for some objects may be limited for performance reasons.'
+                    'Data structure with name/description for related resources.  The output for some objects may be limited for performance reasons.'
                 ),
                 'created': _('Timestamp when this {} was created.'),
                 'modified': _('Timestamp when this {} was last modified.'),
@@ -101,7 +103,7 @@ class Metadata(metadata.SimpleMetadata):
             default = field.get_default()
             if type(default) is UUID:
                 default = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-            if field.field_name == 'TOWER_URL_BASE' and default == 'https://towerhost':
+            if field.field_name == 'TOWER_URL_BASE' and default == 'https://platformhost':
                 default = '{}://{}'.format(self.request.scheme, self.request.get_host())
             field_info['default'] = default
         except serializers.SkipField:
@@ -128,7 +130,7 @@ class Metadata(metadata.SimpleMetadata):
         # Special handling of notification configuration where the required properties
         # are conditional on the type selected.
         if field.field_name == 'notification_configuration':
-            for (notification_type_name, notification_tr_name, notification_type_class) in NotificationTemplate.NOTIFICATION_TYPES:
+            for notification_type_name, notification_tr_name, notification_type_class in NotificationTemplate.NOTIFICATION_TYPES:
                 field_info[notification_type_name] = notification_type_class.init_parameters
 
         # Special handling of notification messages where the required properties
@@ -138,7 +140,7 @@ class Metadata(metadata.SimpleMetadata):
         except (AttributeError, KeyError):
             view_model = None
         if view_model == NotificationTemplate and field.field_name == 'messages':
-            for (notification_type_name, notification_tr_name, notification_type_class) in NotificationTemplate.NOTIFICATION_TYPES:
+            for notification_type_name, notification_tr_name, notification_type_class in NotificationTemplate.NOTIFICATION_TYPES:
                 field_info[notification_type_name] = notification_type_class.default_messages
 
         # Update type of fields returned...

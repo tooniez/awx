@@ -16,9 +16,9 @@ DOCUMENTATION = '''
 ---
 module: job_template
 author: "Wayne Witzel III (@wwitzel3)"
-short_description: create, update, or destroy Automation Platform Controller job templates.
+short_description: create, update, or destroy job templates.
 description:
-    - Create, update, or destroy Automation Platform Controller job templates. See
+    - Create, update, or destroy job templates. See
       U(https://www.ansible.com/tower) for an overview.
 options:
     name:
@@ -49,11 +49,11 @@ options:
       type: str
     inventory:
       description:
-        - Name of the inventory to use for the job template.
+        - Name, ID, or named URL of the inventory to use for the job template.
       type: str
     organization:
       description:
-        - Organization the job template exists in.
+        - Organization name, ID, or named URL the job template exists in.
         - Used to help lookup the object, cannot be modified using this module.
         - The Organization is inferred from the associated project
         - If not provided, will lookup by name only, which does not work with duplicates.
@@ -61,7 +61,7 @@ options:
       type: str
     project:
       description:
-        - Name of the project to use for the job template.
+        - Name, ID, or named URL of the project to use for the job template.
       type: str
     playbook:
       description:
@@ -69,22 +69,22 @@ options:
       type: str
     credential:
       description:
-        - Name of the credential to use for the job template.
+        - Name, ID, or named URL of the credential to use for the job template.
         - Deprecated, use 'credentials'.
       type: str
     credentials:
       description:
-        - List of credentials to use for the job template.
+        - List of credential names, IDs, or named URLs to use for the job template.
       type: list
       elements: str
     vault_credential:
       description:
-        - Name of the vault credential to use for the job template.
+        - Name, ID, or named URL of the vault credential to use for the job template.
         - Deprecated, use 'credentials'.
       type: str
     execution_environment:
       description:
-        - Execution Environment to use for the job template.
+        - Execution Environment name, ID, or named URL to use for the job template.
       type: str
     custom_virtualenv:
       description:
@@ -94,7 +94,7 @@ options:
       type: str
     instance_groups:
       description:
-        - list of Instance Groups for this Organization to run on.
+        - list of Instance Group names, IDs, or named URLs for this Organization to run on.
       type: list
       elements: str
     forks:
@@ -108,8 +108,7 @@ options:
     verbosity:
       description:
         - Control the output level Ansible produces as the playbook runs. 0 - Normal, 1 - Verbose, 2 - More Verbose, 3 - Debug, 4 - Connection Debug.
-      choices: [0, 1, 2, 3, 4]
-      default: 0
+      choices: [0, 1, 2, 3, 4, 5]
       type: int
     extra_vars:
       description:
@@ -123,7 +122,6 @@ options:
       description:
         - Enable forcing playbook handlers to run even if a task fails.
       type: bool
-      default: 'no'
       aliases:
         - force_handlers_enabled
     skip_tags:
@@ -270,7 +268,6 @@ options:
       description:
         - The number of jobs to slice into at runtime. Will cause the Job Template to launch a workflow if value is greater than 1.
       type: int
-      default: '1'
     webhook_service:
       description:
         - Service that webhook requests will be accepted from
@@ -287,7 +284,6 @@ options:
       description:
         - Branch to use in job run. Project default used if blank. Only allowed if project allow_override field is set to true.
       type: str
-      default: ''
     labels:
       description:
         - The labels applied to this job template
@@ -298,7 +294,7 @@ options:
       description:
         - Desired state of the resource.
       default: "present"
-      choices: ["present", "absent"]
+      choices: ["present", "absent", "exists"]
       type: str
     notification_templates_started:
       description:
@@ -324,8 +320,8 @@ extends_documentation_fragment: awx.awx.auth
 
 notes:
   - JSON for survey_spec can be found in the API Documentation. See
-    U(https://docs.ansible.com/ansible-tower/latest/html/towerapi/api_ref.html#/Job_Templates/Job_Templates_job_templates_survey_spec_create)
-    for POST operation payload example.
+    U(https://docs.ansible.com/automation-controller/latest/html/towerapi)
+    for job template survey creation and POST operation payload example.
 '''
 
 
@@ -340,9 +336,10 @@ EXAMPLES = '''
     playbook: "ping.yml"
     credentials:
       - "Local"
+      - "2nd credential"
     state: "present"
     controller_config_file: "~/tower_cli.cfg"
-    survey_enabled: yes
+    survey_enabled: true
     survey_spec: "{{ lookup('file', 'my_survey.json') }}"
 
 - name: Add start notification to Job Template
@@ -407,13 +404,13 @@ def main():
         instance_groups=dict(type="list", elements='str'),
         forks=dict(type='int'),
         limit=dict(),
-        verbosity=dict(type='int', choices=[0, 1, 2, 3, 4], default=0),
+        verbosity=dict(type='int', choices=[0, 1, 2, 3, 4, 5]),
         extra_vars=dict(type='dict'),
         job_tags=dict(),
-        force_handlers=dict(type='bool', default=False, aliases=['force_handlers_enabled']),
+        force_handlers=dict(type='bool', aliases=['force_handlers_enabled']),
         skip_tags=dict(),
         start_at_task=dict(),
-        timeout=dict(type='int', default=0),
+        timeout=dict(type='int'),
         use_fact_cache=dict(type='bool', aliases=['fact_caching_enabled']),
         host_config_key=dict(no_log=False),
         ask_diff_mode_on_launch=dict(type='bool', aliases=['ask_diff_mode']),
@@ -438,7 +435,7 @@ def main():
         allow_simultaneous=dict(type='bool', aliases=['concurrent_jobs_enabled']),
         scm_branch=dict(),
         ask_scm_branch_on_launch=dict(type='bool'),
-        job_slice_count=dict(type='int', default='1'),
+        job_slice_count=dict(type='int'),
         webhook_service=dict(choices=['github', 'gitlab', '']),
         webhook_credential=dict(),
         labels=dict(type="list", elements='str'),
@@ -446,7 +443,7 @@ def main():
         notification_templates_success=dict(type="list", elements='str'),
         notification_templates_error=dict(type="list", elements='str'),
         prevent_instance_group_fallback=dict(type="bool"),
-        state=dict(choices=['present', 'absent'], default='present'),
+        state=dict(choices=['present', 'absent', 'exists'], default='present'),
     )
 
     # Create a module for ourselves
@@ -486,7 +483,7 @@ def main():
         new_fields['execution_environment'] = module.resolve_name_to_id('execution_environments', ee)
 
     # Attempt to look up an existing item based on the provided data
-    existing_item = module.get_one('job_templates', name_or_id=name, **{'data': search_fields})
+    existing_item = module.get_one('job_templates', name_or_id=name, check_exists=(state == 'exists'), **{'data': search_fields})
 
     # Attempt to look up credential to copy based on the provided name
     if copy_from:

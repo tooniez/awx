@@ -22,7 +22,7 @@ Once you have a local copy, run the commands in the following sections from the 
 
 Here are the main `make` targets:
 
-- `docker-compose-build` - used for building the development image, which is used by the `docker-compose` target
+- `docker-compose-build` - used for building the development image, which is used by the `docker-compose` target. You can skip this target if you want to use the latest [ghcr.io/ansible/awx_devel:devel](https://github.com/ansible/awx/pkgs/container/awx_devel) image rather than build a new one.
 - `docker-compose` - make target for development, passes awx_devel image and tag
 
 Notable files:
@@ -33,8 +33,6 @@ Notable files:
 ### Prerequisites
 
 - [Docker](https://docs.docker.com/engine/installation/) on the host where AWX will be deployed. After installing Docker, the Docker service must be started (depending on your OS, you may have to add the local user that uses Docker to the `docker` group, refer to the documentation for details)
-- [docker-compose](https://pypi.org/project/docker-compose/) Python module.
-  - This also installs the `docker` Python module, which is incompatible with [`docker-py`](https://pypi.org/project/docker-py/). If you have previously installed `docker-py`, please uninstall it.
 - [Docker Compose](https://docs.docker.com/compose/install/).
 - [Ansible](https://docs.ansible.com/ansible/latest/installation_guide/intro_installation.html) will need to be installed as we use it to template files needed for the docker-compose.
 - OpenSSL.
@@ -50,13 +48,21 @@ The docker-compose development environment is regularly used and should work on 
 
 Use on other platforms is untested, and may require local changes.
 
-## Configuration
+### How to Disable Color?
 
-In the [`inventory` file](./inventory), set your `pg_password`, `broadcast_websocket_secret`, `secret_key`, and any other settings you need for your deployment.
+There are several layers that might apply color:
+ - docker compose coloring based on what container log comes from
+ - supervisord coloring based on what server it comes from
+ - general coloration from Django management commands
 
-AWX requires access to a PostgreSQL database, and by default, one will be created and deployed in a container, and data will be persisted to a docker volume. When the container is stopped, the database files will still exist in the docker volume. An external database can be used by setting the `pg_host`, `pg_hostname`, and `pg_username`.
+These can have color turned off by adding things to the
+environment variable to modify the call options.
 
-> If you are coming from a Local Docker installation of AWX, consider migrating your data first, see the [data migration section](#migrating-data-from-local-docker) below.
+```
+DJANGO_COLORS=nocolor COMPOSE_UP_OPTS="--no-color" SUPERVISOR_ARGS="-n -t" make docker-compose
+```
+
+This can be useful if this is ran in CI in any context.
 
 ## Starting the Development Environment
 
@@ -120,18 +126,36 @@ $ make docker-compose
 
 > For running docker-compose detached mode, start the containers using the following command: `$ make docker-compose COMPOSE_UP_OPTS=-d`
 
+###### Solving database-related issues during initial startup
+
+If you have encountered the infinitely-repeating `Waiting for postgres to be ready to accept connections` message during the execution, try to do the following:
+
+1. Stop and delete AWX-related docker containers.
+2. Delete all associated docker volumes.
+3. Delete all associated docker networks.
+4. Repeat the process from scratch.
+
+If you have **only** AWX-related container entities in your system, you can simply stop and delete everything using the following commands:
+
+```bash
+docker stop $(docker ps -a -q)
+docker system prune -a
+docker volume prune
+docker network prune
+```
 
 ##### _(alternative method)_ Spin up a development environment with customized mesh node cluster
 
-With the introduction of Receptor, a cluster (of containers) with execution nodes and a hop node can be created by the docker-compose Makefile target.
-By default, it will create 1 hybrid node, 1 hop node, and 2 execution nodes.
-You can switch the type of AWX nodes between hybrid and control with this syntax.
+A cluster (of containers) with execution nodes and a hop node can be created by the docker-compose Makefile target.
+By default, it will create 1 hybrid node.
+You can switch the type of AWX nodes between hybrid and control with `MAIN_NODE_TYPE`.
 
 ```
-MAIN_NODE_TYPE=control COMPOSE_TAG=devel make docker-compose
+MAIN_NODE_TYPE=control EXECUTION_NODE_COUNT=2 COMPOSE_TAG=devel make docker-compose
 ```
 
 Running the above command will create a cluster of 1 control node, 1 hop node, and 2 execution nodes.
+A hop node is automatically created whenever there are 1 or more execution nodes.
 
 The number of nodes can be changed:
 
@@ -177,7 +201,7 @@ The first time you start the environment, database migrations need to run in ord
 ```bash
 awx_1        | Operations to perform:
 awx_1        |   Synchronize unmigrated apps: solo, api, staticfiles, debug_toolbar, messages, channels, django_extensions, ui, rest_framework, polymorphic
-awx_1        |   Apply all migrations: sso, taggit, sessions, sites, kombu_transport_django, social_auth, contenttypes, auth, conf, main
+awx_1        |   Apply all migrations: sso, taggit, sessions, sites, kombu_transport_django, contenttypes, auth, conf, main
 awx_1        | Synchronizing apps without migrations:
 awx_1        |   Creating tables...
 awx_1        |     Running deferred SQL...
@@ -192,13 +216,25 @@ awx_1        |   Applying auth.0001_initial... OK
 
 ##### Clean and build the UI
 
+Prerequisites (on your local machine)
+- npm
+- nodejs
+
+Required versions listed here https://github.com/ansible/ansible-ui/blob/main/README.md
+
+On your local machine (not in awx container)
+
 ```bash
-$ docker exec tools_awx_1 make clean-ui ui-devel
+make clean/ui ui
 ```
 
-See [the ui development documentation](../../awx/ui/README.md) for more information on using the frontend development, build, and test tooling.
+This will clone the ansible-ui into the `awx/ui/src` directory and build the static files. Then when the containers come up, awx-manage collectstatic will copy those files into the proper place.
 
-Once migrations are completed and the UI is built, you can begin using AWX. The UI can be reached in your browser at `https://localhost:8043/#/home`, and the API can be found at `https://localhost:8043/api/v2`.
+You can also use `UI_LOCAL` to build from a locally cloned ansible-ui repo.
+
+See [the ui development documentation](https://github.com/ansible/ansible-ui/blob/main/CONTRIBUTING.md) for more information on using the frontend development, build, and test tooling.
+
+Once migrations are completed and the UI is built, you can begin using AWX. The UI can be reached in your browser at `https://localhost:8043/`, and the API can be found at `https://localhost:8043/api/v2`.
 
 ##### Create an admin user
 
@@ -243,8 +279,6 @@ $ make docker-compose
 - [Using Logstash](./docs/logstash.md)
 - [Start a Cluster](#start-a-cluster)
 - [Start with Minikube](#start-with-minikube)
-- [SAML and OIDC Integration](#saml-and-oidc-integration)
-- [OpenLDAP Integration](#openldap-integration)
 - [Splunk Integration](#splunk-integration)
 
 ### Start a Shell
@@ -295,7 +329,7 @@ Certain features or bugs are only applicable when running a cluster of AWX nodes
 
 `CONTROL_PLANE_NODE_COUNT` is configurable and defaults to 1, effectively a non-clustered AWX.
 
-Note that you may see multiple messages of the form `2021-03-04 20:11:47,666 WARNING [-] awx.main.wsbroadcast Connection from awx_2 to awx_5 failed: 'Cannot connect to host awx_5:8013 ssl:False [Name or service not known]'.`. This can happen when you bring up a cluster of many nodes, say 10, then you bring up a cluster of less nodes, say 3. In this example, there will be 7 `Instance` records in the database that represent AWX instances. The AWX development environment mimics the VM deployment (vs. kubernetes) and expects the missing nodes to be brought back to healthy by the admin. The warning message you are seeing is all of the AWX nodes trying to connect the websocket backplane. You can manually delete the `Instance` records from the database i.e. `Instance.objects.get(hostname='awx_9').delete()` to stop the warnings.
+Note that you may see multiple messages of the form `2021-03-04 20:11:47,666 WARNING [-] awx.main.wsrelay Connection from awx_2 to awx_5 failed: 'Cannot connect to host awx_5:8013 ssl:False [Name or service not known]'.`. This can happen when you bring up a cluster of many nodes, say 10, then you bring up a cluster of less nodes, say 3. In this example, there will be 7 `Instance` records in the database that represent AWX instances. The AWX development environment mimics the VM deployment (vs. kubernetes) and expects the missing nodes to be brought back to healthy by the admin. The warning message you are seeing is all of the AWX nodes trying to connect the websocket backplane. You can manually delete the `Instance` records from the database i.e. `Instance.objects.get(hostname='awx_9').delete()` to stop the warnings.
 
 ### Start with Minikube
 
@@ -304,7 +338,7 @@ To bring up a 1 node AWX + minikube that is accessible from AWX run the followin
 Start minikube
 
 ```bash
-(host)$minikube start --cpus=4  --memory=8g --addons=ingress`
+(host)$minikube start --cpus=4  --memory=8g --addons=ingress
 ```
 
 Start AWX
@@ -324,125 +358,6 @@ If you want to clean all things once your are done, you can do:
 ```bash
 (host)$ make docker-compose-container-group-clean
 ```
-
-### SAML and OIDC Integration
-Keycloak can be used as both a SAML and OIDC provider and can be used to test AWX social auth. This section describes how to build a reference Keycloak instance and plumb it with AWX for testing purposes.
-
-First, be sure that you have the awx.awx collection installed by running `make install_collection`.
-Next, make sure you have your containers running by running `make docker-compose`.
-
-Note: The following instructions assume we are using the built-in postgres database container. If you are not using the internal database you can use this guide as a reference, updating the database fields as required for your connection.
-
-We are now ready to run two one time commands to build and pre-populate the Keycloak database.
-
-The first one time command will be creating a Keycloak database in your postgres database by running:
-```bash
-docker exec tools_postgres_1 /usr/bin/psql -U awx --command "create database keycloak with encoding 'UTF8';"
-```
-
-After running this command the following message should appear and you should be returned to your prompt:
-```base
-CREATE DATABASE
-```
-
-The second one time command will be to start a Keycloak container to build our admin user; be sure to set pg_username and pg_password to work for you installation. Note: the command below set the username as admin with a password of admin, you can change this if you want. Also, if you are using your own container or have changed the pg_username please update the command accordingly.
-```bash
-PG_PASSWORD=`cat tools/docker-compose/_sources/secrets/pg_password.yml  | cut -f 2 -d \'`
-docker run --rm -e KEYCLOAK_USER=admin -e KEYCLOAK_PASSWORD=admin --net=_sources_default \
-           -e DB_VENDOR=postgres -e DB_ADDR=postgres -e DB_DATABASE=keycloak -e DB_USER=awx -e DB_PASSWORD=${PG_PASSWORD} \
-           quay.io/keycloak/keycloak:15.0.2
-```
-
-Once you see a message like: `WFLYSRV0051: Admin console listening on http://127.0.0.1:9990` you can stop the container.
-
-Now that we have performed the one time setup anytime you want to run a Keycloak instance alongside AWX we can start docker-compose with the KEYCLOAK option to get a Keycloak instance with the command:
-```bash
-KEYCLOAK=true make docker-compose
-```
-
-Go ahead and stop your existing docker-compose run and restart with Keycloak before proceeding to the next steps.
-
-Once the containers come up a new port (8443) should be exposed and the Keycloak interface should be running on that port. Connect to this through a url like `https://localhost:8443` to confirm that Keycloak has stared. If you wanted to login and look at Keycloak itself you could select the "Administration console" link and log into the UI the username/password set in the previous `docker run` command. For more information about Keycloak and links to their documentation see their project at https://github.com/keycloak/keycloak.
-
-Now we are ready to configure and plumb Keycloak with AWX. To do this we have provided a playbook which will:
-* Create a certificate for SAML data exchange between Keycloak and AWX.
-* Create a realm in Keycloak with a client for AWX via SAML and OIDC and 3 users.
-* Backup and configure the SMAL and OIDC adapter in AWX. NOTE: the private key of any existing SAML or OIDC adapters can not be backed up through the API, you need a DB backup to recover this.
-
-Before we can run the playbook we need to understand that SAML works by sending redirects between AWX and Keycloak through the browser. Because of this we have to tell both AWX and Keycloak how they will construct the redirect URLs. On the Keycloak side, this is done within the realm configuration and on the AWX side its done through the SAML settings. The playbook requires a variable called `container_reference` to be set. The container_reference variable needs to be how your browser will be able to talk to the running containers.  Here are some examples of how to choose a proper container_reference.
-* If you develop on a mac which runs a Fedora VM which has AWX running within that and the browser you use to access AWX runs on the mac. The the VM with the container has its own IP that is mapped to a name like `tower.home.net`. In this scenario your "container_reference" could be either the IP of the VM or the tower.home.net friendly name.
-* If you are on a Fedora work station running AWX and also using a browser on your workstation you could use localhost, your work stations IP or hostname as the container_reference.
-
-In addition, OIDC works similar but slightly differently. OIDC has browser redirection but OIDC will also communicate from the AWX docker instance to the Keycloak docker instance directly. Any hostnames you might have are likely not propagated down into the AWX container. So we need a method for both the browser and AWX container to talk to Keycloak. For this we will likely use your machines IP address. This can be passed in as a variable called `oidc_reference`. If unset this will default to container_reference which may be viable for some configurations.
-
-In addition to container_reference, there are some additional variables which you can override if you need/choose to do so. Here are their names and default values:
-```yaml
-    keycloak_user: admin
-    keycloak_pass: admin
-    cert_subject:  "/C=US/ST=NC/L=Durham/O=awx/CN="
-```
-
-* keycloak_(user|pass) need to change if you modified the user when starting the initial container above.
-* cert_subject will be the subject line of the certificate shared between AWX and keycloak you can change this if you like or just use the defaults.
-
-To override any of the variables above you can add more `-e` arguments to the playbook run below. For example, if you simply need to change the `keycloak_pass` add the argument `-e keycloak_pass=my_secret_pass` to the following ansible-playbook command.
-
-In addition, you may need to override the username or password to get into your AWX instance. We log into AWX in order to read and write the SAML and OIDC settings. This can be done in several ways because we are using the awx.awx collection. The easiest way is to set environment variables such as `CONTROLLER_USERNAME`. See the awx.awx documentation for more information on setting environment variables. In the example provided below we are showing an example of specifying a username/password for authentication.
-
-Now that we have all of our variables covered we can run the playbook like:
-```bash
-export CONTROLLER_USERNAME=<your username>
-export CONTROLLER_PASSWORD=<your password>
-ansible-playbook tools/docker-compose/ansible/plumb_keycloak.yml -e container_reference=<your container_reference here> -e oidc_reference=<your oidc reference>
-```
-
-Once the playbook is done running both SAML and OIDC should now be setup in your development environment. This realm has three users with the following username/passwords:
-1. awx_unpriv:unpriv123
-2. awx_admin:admin123
-3. awx_auditor:audit123
-
-The first account is a normal user. The second account has the SMAL attribute is_superuser set in Keycloak so will be a super user in AWX if logged in through SAML. The third account has the SAML is_system_auditor attribute in Keycloak so it will be a system auditor in AWX if logged in through SAML. To log in with one of these Keycloak users go to the AWX login screen and click the small "Sign In With SAML Keycloak" button at the bottom of the login box.
-
-Note: The OIDC adapter performs authentication only, not authorization. So any user created in AWX will not have any permissions on it at all.
-
-If you Keycloak configuration is not working and you need to rerun the playbook to try a different `container_reference` or `oidc_reference` you can log into the Keycloak admin console on port 8443 and select the AWX realm in the upper left drop down. Then make sure you are on "Ream Settings" in the Configure menu option and click the trash can next to AWX in the main page window pane. This will completely remove the AWX ream (which has both SAML and OIDC settings) enabling you to re-run the plumb playbook.
-
-### OpenLDAP Integration
-
-OpenLDAP is an LDAP provider that can be used to test AWX with LDAP integration. This section describes how to build a reference OpenLDAP instance and plumb it with your AWX for testing purposes.
-
-First, be sure that you have the awx.awx collection installed by running `make install_collection`.
-
-Anytime you want to run an OpenLDAP instance alongside AWX we can start docker-compose with the LDAP option to get an LDAP instance with the command:
-```bash
-LDAP=true make docker-compose
-```
-
-Once the containers come up two new ports (389, 636) should be exposed and the LDAP server should be running on those ports. The first port (389) is non-SSL and the second port (636) is SSL enabled.
-
-Now we are ready to configure and plumb OpenLDAP with AWX. To do this we have provided a playbook which will:
-* Backup and configure the LDAP adapter in AWX. NOTE: this will back up your existing settings but the password fields can not be backed up through the API, you need a DB backup to recover this.
-
-Note: The default configuration will utilize the non-tls connection. If you want to use the tls configuration you will need to work through TLS negotiation issues because the LDAP server is using a self signed certificate.
-
-Before we can run the playbook we need to understand that LDAP will be communicated to from within the AWX container. Because of this, we have to tell AWX how to route traffic to the LDAP container through the `LDAP Server URI` settings. The playbook requires a variable called container_reference to be set. The container_reference variable needs to be how your AWX container will be able to talk to the LDAP container. See the SAML section for some examples for how to select a `container_reference`.
-
-Once you have your container reference you can run the playbook like:
-```bash
-export CONTROLLER_USERNAME=<your username>
-export CONTROLLER_PASSWORD=<your password>
-ansible-playbook tools/docker-compose/ansible/plumb_ldap.yml -e container_reference=<your container_reference here>
-```
-
-
-Once the playbook is done running LDAP should now be setup in your development environment. This realm has four users with the following username/passwords:
-1. awx_ldap_unpriv:unpriv123
-2. awx_ldap_admin:admin123
-3. awx_ldap_auditor:audit123
-4. awx_ldap_org_admin:orgadmin123
-
-The first account is a normal user. The second account will be a super user in AWX. The third account will be a system auditor in AWX. The fourth account is an org admin. All users belong to an org called "LDAP Organization". To log in with one of these users go to the AWX login screen enter the username/password.
-
 
 ### Splunk Integration
 
@@ -474,7 +389,66 @@ ansible-playbook tools/docker-compose/ansible/plumb_splunk.yml
 
 Once the playbook is done running Splunk should now be setup in your development environment. You can log into the admin console (see above for username/password) and click on "Searching and Reporting" in the left hand navigation. In the search box enter `source="http:tower_logging_collections"` and click search.
 
+### HashiVault Integration
+
+Run a HashiVault container alongside of AWX.
+
+```bash
+VAULT=true make docker-compose
+```
+
+You can find the initialization data at `tools/docker-compose/_sources/secrets/vault_init.yml`,
+This includes the unseal keys and a root token.
+
+You will need to unseal the HashiVault each time the container is started.
+The easiest way to do that is to run:
+```bash
+ansible-playbook tools/docker-compose/ansible/unseal_vault.yml
+```
+This will perform the unseal and also display the root token for login.
+
+For demo purposes, Vault will be auto-configured to include a Key Value (KV) vault called `my_engine` along with a secret called `my_key` in `/my_engine/my_root/my_folder`.
+The secret value is `this_is_the_secret_value`.
+
+To create a secret connected to this vault in AWX you can run the following playbook:
+```bash
+export CONTROLLER_USERNAME=<your username>
+export CONTROLLER_PASSWORD=<your password>
+ansible-playbook tools/docker-compose/ansible/plumb_vault.yml
+```
+
+This will create the following items in your AWX instance:
+* A credential called `Vault Lookup Cred` tied to the vault instance.
+* A credential called `Vault UserPass Lookup Cred` tied to the vault instance.
+* A custom credential type called `Vault Custom Cred Type`.
+* A credential called `Credential From HashiCorp Vault via Token Auth` which is of the created type using the `Vault Lookup Cred` to get the secret.
+* A credential called `Credential From HashiCorp Vault via UserPass Auth` which is of the created type using the `Vault Userpass Lookup Cred` to get the secret.
+
+The custom credential type adds a variable when used in a playbook called `the_secret_from_vault`.
+If you have a playbook like:
+```
+---
+- name: Show a vault secret
+  hosts: localhost
+  connection: local
+  gather_facts: False
+  tasks:
+    - debug:
+        var: the_secret_from_vault
+```
+
+And run it through AWX with the credential `Credential From Vault via Token Auth` tied to it, the debug should result in `this_is_the_secret_value`. If you run it through AWX with the credential `Credential From Vault via Userpass Auth`, the debug should result in `this_is_the_userpass_secret_value`.
 
 ### Prometheus and Grafana integration
 
 See docs at https://github.com/ansible/awx/blob/devel/tools/grafana/README.md
+
+### OpenTelemetry Integration
+
+```bash
+OTEL=true GRAFANA=true LOKI=true PROMETHEUS=true make docker-compose
+```
+
+This will start the sidecar container `tools_otel_1` and configure AWX logging to send to it. The OpenTelemetry Collector is configured to export logs to Loki. Grafana is configured with Loki as a datasource. AWX logs can be viewed in Grafana.
+
+`http://localhost:3001` grafana
